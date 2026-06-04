@@ -122,6 +122,58 @@ class ElectrumXClient:
     # Verbindung
     # ========================================================
 
+    # TCP-Keepalive-Parameter. Default-OS-Werte (Windows: 2 Stunden Idle)
+    # sind für ein interaktives Wallet zu lang. Mit diesen Werten erkennt
+    # das Wallet eine tote Verbindung typischerweise binnen ca. 45 Sekunden
+    # und der Auto-Reconnect in _call() greift transparent.
+    KEEPALIVE_IDLE_SEC = 30      # Sekunden Idle vor erstem Probe
+    KEEPALIVE_INTERVAL_SEC = 5   # Sekunden zwischen Probes
+    KEEPALIVE_PROBES = 3         # Anzahl Probes ohne Antwort, bevor Verbindung tot ist
+
+    @classmethod
+    def _setup_keepalive(cls, sock: socket.socket) -> None:
+        """
+        Aktiviert TCP-Keepalive auf einem rohen TCP-Socket – plattformsicher.
+
+        Muss aufgerufen werden BEVOR der Socket per SSL gewrappt wird. Schlägt
+        eine plattformspezifische Option fehl, wird sie still übersprungen
+        (auf alten Linux-Kerneln, restriktiven Sandboxes etc.).
+        """
+        # Basis-Option: funktioniert überall.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except (OSError, AttributeError):
+            return
+
+        idle = cls.KEEPALIVE_IDLE_SEC
+        intv = cls.KEEPALIVE_INTERVAL_SEC
+
+        # Windows: SIO_KEEPALIVE_VALS akzeptiert Millisekunden.
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, intv * 1000))
+                return
+            except (OSError, AttributeError):
+                pass
+
+        # Linux: TCP_KEEPIDLE / KEEPINTVL / KEEPCNT
+        try:
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, intv)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, cls.KEEPALIVE_PROBES)
+        except (OSError, AttributeError):
+            pass
+
+        # macOS: TCP_KEEPALIVE (Sekunden Idle vor Probe)
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)
+            except (OSError, AttributeError):
+                pass
+
     def connect(self) -> bool:
         """
         Verbindet zum ersten erreichbaren ElectrumX-Server.
@@ -139,6 +191,8 @@ class ElectrumXClient:
 
                 self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self._socket.settimeout(self.timeout)
+                # Tote/Idle-Verbindungen schnell erkennen (NAT-Timeouts etc.).
+                self._setup_keepalive(self._socket)
 
                 ctx = self._build_ssl_context()
                 self._ssl_socket = ctx.wrap_socket(self._socket, server_hostname=host)
