@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 WALLET_FILE_VERSION = 1
+STATE_FILE_SUFFIX = ".state.json"   # State-Datei neben wallet.dat
 DEFAULT_KDF_PARAMS = {
     "n": 2**20,  # CPU/Memory-Kosten (ca. 1 GB RAM, ~1s auf moderner HW)
     "r": 8,
@@ -323,6 +324,13 @@ class WalletManager:
         temp_path.replace(filepath)
         self._wallet_path = filepath
 
+        # State-Datei (Indizes, Discovery-Marker) parallel schreiben.
+        # Fehler hier sind nicht fatal – die Wallet-Datei selbst ist sicher.
+        try:
+            self.save_state()
+        except Exception as e:
+            logger.warning(f"State-Datei konnte nicht geschrieben werden: {e}")
+
         logger.info(f"Wallet gespeichert: {filepath}")
         return str(filepath)
 
@@ -374,6 +382,16 @@ class WalletManager:
 
         # Sub-Wallets initialisieren
         self._init_wallets()
+
+        # State-Datei lesen, falls vorhanden, und in DOI-Wallet einspielen.
+        # Bei Fehlern oder fehlender Datei: kein Problem, beim nächsten
+        # connect() läuft die Discovery und schreibt die State-Datei neu.
+        try:
+            state = self._load_state_file()
+            if state and self.doi:
+                self.doi.set_state(state.get("doi", {}))
+        except Exception as e:
+            logger.warning(f"State-Datei konnte nicht gelesen werden: {e}")
 
         logger.info(f"Wallet geladen: {filepath}")
         return self.primary_addresses
@@ -574,7 +592,13 @@ class WalletManager:
             if not self.doi:
                 raise RuntimeError("DOI-Wallet nicht initialisiert")
             fee_rate = kwargs.get("fee_rate", 10)
-            return self.doi.send(to_address, amount, fee_per_byte=fee_rate)
+            result = self.doi.send(to_address, amount, fee_per_byte=fee_rate)
+            # Indizes nach Send persistieren (Best Effort).
+            try:
+                self.save_state()
+            except Exception as e:
+                logger.warning(f"State-Persistenz nach DOI-Send fehlgeschlagen: {e}")
+            return result
 
         elif chain == "TRX":
             if not self.tron:
@@ -714,6 +738,55 @@ class WalletManager:
             "eth_address": self.eth.address if self.eth else None,
             "eth_available": HAS_ETH,
         }
+
+    # ──────────────────────────────────────────
+    # State-Persistenz (separate .state.json neben wallet.dat)
+    # ──────────────────────────────────────────
+
+    @property
+    def _state_path(self) -> Optional[Path]:
+        """Pfad zur State-Datei. None wenn das Wallet nicht gespeichert ist."""
+        if not self._wallet_path:
+            return None
+        return self._wallet_path.with_suffix(self._wallet_path.suffix + STATE_FILE_SUFFIX)
+
+    def save_state(self) -> Optional[str]:
+        """
+        Schreibt nur die State-Datei (Indizes etc.).
+
+        Wird automatisch nach save() und nach jedem DOI-send() aufgerufen –
+        kann aber auch manuell ausgelöst werden, z.B. aus einem
+        Diagnose-Button im GUI.
+        """
+        state_path = self._state_path
+        if not state_path:
+            return None
+
+        payload: dict = {
+            "version": 1,
+            "wallet": self._wallet_path.name if self._wallet_path else None,
+            "updated": datetime.now(timezone.utc).isoformat(),
+        }
+        if self.doi:
+            try:
+                payload["doi"] = self.doi.get_state()
+            except Exception as e:
+                logger.warning(f"DoiWallet.get_state() fehlgeschlagen: {e}")
+
+        # Atomar schreiben
+        tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        tmp.replace(state_path)
+        return str(state_path)
+
+    def _load_state_file(self) -> Optional[dict]:
+        """Liest die State-Datei, falls vorhanden. Sonst None."""
+        state_path = self._state_path
+        if not state_path or not state_path.exists():
+            return None
+        with open(state_path, "r") as f:
+            return json.load(f)
 
     # ──────────────────────────────────────────
     # Cleanup
