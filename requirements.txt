@@ -1,0 +1,27 @@
+# DOI-Wallet-iX – Abhängigkeiten
+# © 2026 Ottmar Neuburger, WEBanizer AG – MIT License
+#
+# Installation: pip install -r requirements.txt
+
+# ── GUI ──
+customtkinter>=5.2.0
+Pillow>=10.0.0
+qrcode>=7.4.0
+
+# ── Kryptographie ──
+ecdsa>=0.18.0
+mnemonic>=0.21
+pycryptodome>=3.20.0
+
+# ── Ethereum / Web3 ──
+web3>=6.0.0
+eth-account>=0.11.0
+bip-utils>=2.9.0
+
+# ── Netzwerk & Konfiguration ──
+requests>=2.31.0
+PyYAML>=6.0
+certifi>=2024.0.0
+
+# ── Build (optional, nur für EXE-Erstellung) ──
+# pyinstaller>=6.0

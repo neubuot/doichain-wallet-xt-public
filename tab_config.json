@@ -1,0 +1,52 @@
+[
+  {
+    "name": "Wallet-1",
+    "dat_file": "wallet.dat",
+    "was_loaded": true
+  },
+  {
+    "name": "Mein-Wallet-2",
+    "dat_file": "C:/__py/doichain-wallet/doichain-wallet-xt/doichain-wallet-xt-complete/wallet-2.dat",
+    "was_loaded": true
+  },
+  {
+    "name": "Wallet-3",
+    "dat_file": "C:/__py/doichain-wallet/doichain-wallet-xt/doichain-wallet-xt-complete/wallet-2.dat",
+    "was_loaded": true
+  },
+  {
+    "name": "Wallet-4",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-5",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-6",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-7",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-8",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-9",
+    "dat_file": null,
+    "was_loaded": false
+  },
+  {
+    "name": "Wallet-10",
+    "dat_file": null,
+    "was_loaded": false
+  }
+]

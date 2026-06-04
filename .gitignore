@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+.env
+
+# Build
+build/
+dist/
+*.spec.bak
+*.exe
+*.msi
+
+# Wallet & Userdata (NIEMALS committen!)
+*.dat
+wallet.dat
+wallet-*.dat
+tx_notes.json
+daily_sends.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Lokale Configs mit Keys
+config/config.local.yaml
+
+# Lokale Wallet-Konfiguration (Keys!)
+config/config.yaml

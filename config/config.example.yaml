@@ -1,0 +1,36 @@
+﻿# DOI-Wallet-iX – Beispiel-Konfiguration
+# Kopiere diese Datei nach config/config.yaml und trage deine eigenen Keys ein.
+
+doichain:
+  electrum_servers:
+    - { host: white-snail-54.doi.works,   port: 50002, protocol: ssl }
+    - { host: itchy-jellyfish-89.doi.works, port: 50002, protocol: ssl }
+    - { host: ugly-bird-70.doi.works,     port: 50002, protocol: ssl }
+  network: mainnet
+
+general:
+  display_currency: EUR
+  log_level: INFO
+
+safety:
+  daily_limit_eur: 5.0
+  undo_seconds: 10
+
+tron:
+  api_key: ''              # https://www.trongrid.io – kostenloser Public-API-Key
+  bip44_coin_type: 195
+  full_node: https://api.trongrid.io
+  min_trx_reserve: 10.0
+  usdt_contract: TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
+
+wallet:
+  encryption: AES-256-GCM
+  seed_language: english
+  seed_words: 24
+  wallet_file: wallet.dat
+
+xt_com:
+  api_key: ''              # https://www.xt.com – API-Key aus deinem XT-Account
+  api_secret: ''           # API-Secret aus deinem XT-Account
+  base_url: https://sapi.xt.com
+  symbol: doi_usdt
