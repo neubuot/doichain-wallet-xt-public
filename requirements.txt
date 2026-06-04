@@ -16,7 +16,8 @@ pycryptodome>=3.20.0
 # ── Ethereum / Web3 ──
 web3>=6.0.0
 eth-account>=0.11.0
-bip-utils>=2.9.0
+# bip-utils>=2.9.0   # entfernt: nicht verwendet, benötigt C++-Compiler.
+#                    # BIP-32/44 wird in src/wallet/seed_manager.py manuell abgeleitet.
 
 # ── Netzwerk & Konfiguration ──
 requests>=2.31.0

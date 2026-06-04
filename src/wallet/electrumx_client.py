@@ -6,13 +6,24 @@ Kommuniziert über SSL/TCP mit ElectrumX-Servern für:
 - Transaktions-Broadcast
 - Blockchain-Header
 - Adress-Saldo
+
+Sicherheits-Updates (v0.9.5):
+  * TLS: Standardmäßig strikte CA- und Hostname-Validierung. Optionales
+    Certificate-Pinning per SHA-256 Fingerprint. Klartext-CERT_NONE ist
+    nur noch über expliziten Opt-out (ssl_strict=False) erreichbar – und
+    wird bei jedem Verbindungsaufbau geloggt.
+  * Scripthash unterstützt jetzt ALLE Adresstypen (P2PKH, P2SH, P2WPKH,
+    P2WSH, P2TR) via crypto_utils.address_to_script_pubkey().
+  * Saubere Puffer-basierte Empfangslogik (auch für große Antworten und
+    nachfolgende Notifications).
+  * Auto-Reconnect bei Verbindungsabbruch während eines Aufrufs.
 """
 
+import hashlib
 import json
 import socket
 import ssl
-import time
-import hashlib
+import sys
 from typing import Optional
 
 from .doichain_network import MAINNET
@@ -21,7 +32,7 @@ from .doichain_network import MAINNET
 class ElectrumXClient:
     """
     JSON-RPC Client für ElectrumX-Server (Doichain).
-    
+
     Verwendet das Electrum-Protokoll v1.4 über SSL.
     """
 
@@ -38,6 +49,8 @@ class ElectrumXClient:
         self._ssl_socket: Optional[ssl.SSLSocket] = None
         self._request_id = 0
         self._connected = False
+        self._recv_buffer = b""
+        self._current_server: Optional[dict] = None
 
         # Server aus Netzwerk-Config oder Parameter
         if host and port:
@@ -45,40 +58,119 @@ class ElectrumXClient:
         else:
             self.servers = self.network.get("electrum_servers", [])
 
+    # ========================================================
+    # SSL-Kontext (gehärtet)
+    # ========================================================
+
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        """
+        Baut einen SSL-Kontext entsprechend der Netzwerk-Konfiguration.
+
+        Priorität:
+          1. ssl_pinned_fingerprints nicht leer  → Pinning (Hostname-Check aus,
+             CA-Check aus, dafür nach connect() Fingerprint-Vergleich).
+          2. ssl_strict = True (Default)        → CA + Hostname strikt.
+          3. ssl_strict = False                 → Validierung aus (UNSICHER).
+        """
+        pinned = self.network.get("ssl_pinned_fingerprints") or []
+        strict = self.network.get("ssl_strict", True)
+
+        ctx = ssl.create_default_context()
+
+        if pinned:
+            # Pinning übernimmt die Identitätsprüfung. CA-Chain darf ungültig sein
+            # (self-signed), wir prüfen hinterher den Fingerprint.
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+        if strict:
+            # Strikte Validierung mit System-CAs (oder certifi, je nach Python-Build).
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            return ctx
+
+        # Expliziter Opt-out: Validierung deaktiviert. Mit Warnhinweis.
+        print(
+            "⚠️  WARNUNG: TLS-Validierung deaktiviert (ssl_strict=False). "
+            "Verbindung ist anfällig für Man-in-the-Middle-Angriffe.",
+            file=sys.stderr,
+        )
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _verify_pinned_fingerprint(self, ssl_socket: ssl.SSLSocket) -> bool:
+        """
+        Vergleicht den SHA-256 Fingerprint des Server-Zertifikats gegen die
+        Allowlist in network['ssl_pinned_fingerprints'].
+        """
+        pinned = [
+            fp.lower().replace(":", "").replace(" ", "")
+            for fp in (self.network.get("ssl_pinned_fingerprints") or [])
+        ]
+        if not pinned:
+            return True  # Pinning nicht aktiv
+
+        der_cert = ssl_socket.getpeercert(binary_form=True)
+        if not der_cert:
+            return False
+        actual = hashlib.sha256(der_cert).hexdigest()
+        return actual in pinned
+
+    # ========================================================
+    # Verbindung
+    # ========================================================
+
     def connect(self) -> bool:
         """
         Verbindet zum ersten erreichbaren ElectrumX-Server.
-        
+
         Returns:
-            True bei erfolgreicher Verbindung
+            True bei erfolgreicher Verbindung.
         """
+        last_error: Optional[Exception] = None
+
         for server in self.servers:
             try:
+                self._cleanup()
                 host = server["host"]
                 port = server["port"]
-                
-                # TCP Socket
+
                 self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self._socket.settimeout(self.timeout)
 
-                # SSL Kontext (self-signed Zertifikate akzeptieren)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-
+                ctx = self._build_ssl_context()
                 self._ssl_socket = ctx.wrap_socket(self._socket, server_hostname=host)
                 self._ssl_socket.connect((host, port))
+
+                # Pinning prüfen, falls aktiv
+                if not self._verify_pinned_fingerprint(self._ssl_socket):
+                    self._cleanup()
+                    last_error = ssl.SSLError(
+                        f"Certificate-Pinning fehlgeschlagen für {host}: "
+                        f"Fingerprint nicht in ssl_pinned_fingerprints."
+                    )
+                    continue
+
                 self._connected = True
+                self._current_server = server
+                self._recv_buffer = b""
 
                 # Server-Version handshake
                 result = self._call("server.version", ["doichain-wallet", "1.4"])
                 if result:
                     return True
 
-            except (socket.error, ssl.SSLError, OSError, ConnectionRefusedError) as e:
+            except (socket.error, ssl.SSLError, OSError,
+                    ConnectionRefusedError, ConnectionError) as e:
+                last_error = e
                 self._cleanup()
                 continue
 
+        if last_error is not None:
+            print(f"⚠️  Kein ElectrumX-Server erreichbar. Letzter Fehler: {last_error}",
+                  file=sys.stderr)
         return False
 
     def disconnect(self):
@@ -100,21 +192,32 @@ class ElectrumXClient:
         self._ssl_socket = None
         self._socket = None
         self._connected = False
+        self._recv_buffer = b""
 
-    def _call(self, method: str, params: list = None) -> any:
+    def _reconnect(self) -> bool:
+        """Versucht, die Verbindung wiederherzustellen."""
+        self._cleanup()
+        return self.connect()
+
+    # ========================================================
+    # RPC
+    # ========================================================
+
+    def _call(self, method: str, params: list = None, _retry: bool = True) -> any:
         """
         JSON-RPC Aufruf an den ElectrumX-Server.
-        
+
         Args:
-            method: RPC-Methode (z.B. "blockchain.scripthash.get_balance")
-            params: Parameter-Liste
-        
+            method: RPC-Methode (z.B. "blockchain.scripthash.get_balance").
+            params: Parameter-Liste.
+            _retry: intern – bei Verbindungsabbruch genau einmal neu verbinden.
+
         Returns:
-            Ergebnis des Aufrufs
-        
+            Ergebnis des Aufrufs.
+
         Raises:
-            ConnectionError: Bei Verbindungsproblemen
-            RuntimeError: Bei RPC-Fehlern
+            ConnectionError: Bei Verbindungsproblemen, die auch nach Reconnect bestehen.
+            RuntimeError: Bei RPC-Fehlern vom Server.
         """
         if not self._ssl_socket:
             raise ConnectionError("Nicht verbunden. Zuerst connect() aufrufen.")
@@ -126,60 +229,82 @@ class ElectrumXClient:
             "method": method,
             "params": params or [],
         }
+        msg = (json.dumps(request) + "\n").encode("utf-8")
 
-        # Request senden
-        msg = json.dumps(request) + "\n"
-        self._ssl_socket.sendall(msg.encode("utf-8"))
+        try:
+            self._ssl_socket.sendall(msg)
+            line = self._recv_line()
+        except (socket.error, ssl.SSLError, ConnectionError, OSError) as e:
+            # Einmaliger Reconnect-Versuch
+            if _retry and self._reconnect():
+                return self._call(method, params, _retry=False)
+            raise ConnectionError(f"Verbindung verloren: {e}") from e
 
-        # Response empfangen
-        response_data = b""
-        while True:
-            chunk = self._ssl_socket.recv(4096)
-            if not chunk:
-                raise ConnectionError("Verbindung geschlossen")
-            response_data += chunk
-            if b"\n" in response_data:
-                break
-
-        # Erste Zeile parsen (eine Antwort pro Zeile)
-        line = response_data.split(b"\n")[0]
         response = json.loads(line.decode("utf-8"))
 
         if "error" in response and response["error"]:
-            raise RuntimeError(
-                f"ElectrumX Fehler: {response['error']}"
-            )
+            raise RuntimeError(f"ElectrumX Fehler: {response['error']}")
 
         return response.get("result")
 
+    def _recv_line(self) -> bytes:
+        """
+        Liest eine vollständige, mit '\\n' terminierte JSON-Antwortzeile aus
+        dem Socket. Restliche bereits empfangene Bytes werden gepuffert und
+        beim nächsten Aufruf zuerst verarbeitet (wichtig für asynchrone
+        Server-Notifications und große Antworten).
+        """
+        # Hinweis: subscriptions (z.B. blockchain.headers.subscribe) liefern
+        # asynchrone Notifications. Diese würden hier als Antwortzeile
+        # interpretiert werden – aktuell verwendet der Wallet keine
+        # langlebigen Subscriptions, daher okay. TODO: Bei späterem
+        # Subscription-Support nach 'id' vs. notification differenzieren.
+
+        while b"\n" not in self._recv_buffer:
+            chunk = self._ssl_socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("Verbindung geschlossen (recv 0 bytes)")
+            self._recv_buffer += chunk
+
+        line, _, self._recv_buffer = self._recv_buffer.partition(b"\n")
+        return line
+
     # ========================================================
-    # Electrum Scripthash
+    # Electrum Scripthash – jetzt für ALLE Adresstypen
     # ========================================================
 
     @staticmethod
-    def address_to_scripthash(address: str) -> str:
+    def address_to_scripthash(address: str, bech32_hrp: str = "dc") -> str:
         """
         Konvertiert eine Doichain-Adresse in einen Electrum-Scripthash.
-        
-        Electrum verwendet den SHA256-Hash des P2PKH-ScriptPubKey
-        in reversed Byte-Reihenfolge als Identifier.
-        
+
+        Unterstützte Adresstypen (delegiert an crypto_utils.address_to_script_pubkey):
+          - P2PKH   (Legacy, N.../M...)
+          - P2SH    (z.B. 3...)
+          - P2WPKH  (Native SegWit, dc1q..., 20 Bytes)
+          - P2WSH   (Native SegWit, dc1q..., 32 Bytes)
+          - P2TR    (Taproot, dc1p..., 32 Bytes)
+
+        Electrum-Scripthash = SHA256(scriptPubKey) in reversed Byte-Reihenfolge.
+
         Args:
-            address: Doichain Base58Check-Adresse
-        
+            address: Doichain-Adresse (beliebiger unterstützter Typ).
+            bech32_hrp: Bech32 Human-Readable Part (Default: "dc" für Doichain).
+
         Returns:
-            Hex-String des Scripthash
+            Hex-String des Scripthashes (64 Zeichen).
         """
-        from .crypto_utils import base58check_decode
+        from .crypto_utils import address_to_script_pubkey
 
-        version, pubkey_hash = base58check_decode(address)
-
-        # P2PKH ScriptPubKey: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-        script = bytes([0x76, 0xA9, 0x14]) + pubkey_hash + bytes([0x88, 0xAC])
-
-        # SHA256 und Byte-Reihenfolge umkehren
+        script = address_to_script_pubkey(address, bech32_hrp=bech32_hrp)
         h = hashlib.sha256(script).digest()
         return h[::-1].hex()
+
+    def _scripthash(self, address: str) -> str:
+        """Komfort: nutzt den HRP aus self.network."""
+        return self.address_to_scripthash(
+            address, bech32_hrp=self.network.get("bech32_hrp", "dc")
+        )
 
     # ========================================================
     # Öffentliche API-Methoden
@@ -188,15 +313,11 @@ class ElectrumXClient:
     def get_balance(self, address: str) -> dict:
         """
         Gibt den Saldo einer Adresse zurück.
-        
-        Args:
-            address: Doichain-Adresse
-        
+
         Returns:
-            Dict mit 'confirmed' und 'unconfirmed' (in Satoshis)
+            Dict mit 'confirmed' und 'unconfirmed' (in Satoshis).
         """
-        scripthash = self.address_to_scripthash(address)
-        result = self._call("blockchain.scripthash.get_balance", [scripthash])
+        result = self._call("blockchain.scripthash.get_balance", [self._scripthash(address)])
         return {
             "confirmed": result.get("confirmed", 0),
             "unconfirmed": result.get("unconfirmed", 0),
@@ -206,33 +327,16 @@ class ElectrumXClient:
     def get_utxos(self, address: str) -> list:
         """
         Gibt die unverbrauchten Transaktionsausgaben (UTXOs) einer Adresse zurück.
-        
-        Args:
-            address: Doichain-Adresse
-        
-        Returns:
-            Liste von UTXOs: [{"tx_hash": ..., "tx_pos": ..., "value": ..., "height": ...}, ...]
         """
-        scripthash = self.address_to_scripthash(address)
-        return self._call("blockchain.scripthash.listunspent", [scripthash])
+        return self._call("blockchain.scripthash.listunspent", [self._scripthash(address)])
 
     def get_history(self, address: str) -> list:
-        """
-        Gibt die Transaktionshistorie einer Adresse zurück.
-        
-        Returns:
-            Liste: [{"tx_hash": ..., "height": ...}, ...]
-        """
-        scripthash = self.address_to_scripthash(address)
-        return self._call("blockchain.scripthash.get_history", [scripthash])
+        """Gibt die Transaktionshistorie einer Adresse zurück."""
+        return self._call("blockchain.scripthash.get_history", [self._scripthash(address)])
 
     def get_transaction(self, tx_hash: str, verbose: bool = True) -> dict:
         """
         Gibt eine Transaktion als Hex oder als Verbose-Dict zurück.
-        
-        Args:
-            tx_hash: Transaktions-Hash (64 Hex-Zeichen)
-            verbose: True für detaillierte Infos, False für Raw-Hex
         """
         return self._call("blockchain.transaction.get", [tx_hash, verbose])
 
@@ -243,15 +347,12 @@ class ElectrumXClient:
     def broadcast_transaction(self, raw_tx_hex: str) -> str:
         """
         Sendet eine signierte Transaktion an das Netzwerk.
-        
-        Args:
-            raw_tx_hex: Signierte Transaktion als Hex-String
-        
+
         Returns:
-            Transaktions-Hash bei Erfolg
-        
+            Transaktions-Hash bei Erfolg.
+
         Raises:
-            RuntimeError: Bei Ablehnung durch den Server
+            RuntimeError: Bei Ablehnung durch den Server.
         """
         return self._call("blockchain.transaction.broadcast", [raw_tx_hex])
 
@@ -266,12 +367,6 @@ class ElectrumXClient:
     def get_fee_estimate(self, target_blocks: int = 6) -> Optional[float]:
         """
         Schätzt die Transaktionsgebühr (DOI/kB).
-        
-        Args:
-            target_blocks: Gewünschte Bestätigungszeit in Blöcken
-        
-        Returns:
-            Geschätzte Gebühr in DOI/kB, oder None
         """
         try:
             result = self._call("blockchain.estimatefee", [target_blocks])
@@ -307,3 +402,8 @@ class ElectrumXClient:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def current_server(self) -> Optional[dict]:
+        """Aktiver Server (Host/Port-Dict), falls verbunden."""
+        return self._current_server
