@@ -56,17 +56,17 @@ except ImportError:
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
 WALLET_FILE = "wallet.dat"
 MAX_WALLET_SLOTS = 10
 
-# Farben
-COLOR_BG = "#1a1a2e"
-COLOR_SIDEBAR = "#16213e"
-COLOR_CARD = "#1f2b47"
+# Farben (v0.9.5: leicht aufgehellt für moderneren Look, Palette bleibt vertraut)
+COLOR_BG = "#1e1e35"           # +Lift gegenüber #1a1a2e
+COLOR_SIDEBAR = "#1a2645"      # +Lift gegenüber #16213e
+COLOR_CARD = "#243352"         # +Lift gegenüber #1f2b47
 COLOR_ACCENT = "#0f969c"
 COLOR_ACCENT_HOVER = "#0db8a0"
 COLOR_SUCCESS = "#00d26a"
@@ -79,6 +79,11 @@ COLOR_TRX = "#ff0013"
 COLOR_USDT = "#26a17b"
 COLOR_ETH = "#627eea"
 COLOR_WDOI = "#f7931a"  # Gleich wie DOI, da Wrapped Doichain
+
+# Eckenradien (v0.9.5: durchgehend etwas geschmeidiger)
+RADIUS_BUTTON = 10
+RADIUS_CARD = 14
+RADIUS_DIALOG = 12
 
 
 def load_config():
@@ -570,8 +575,9 @@ class WalletApp(ctk.CTk):
                 font=ctk.CTkFont(size=14),
                 height=40, anchor="w",
                 fg_color="transparent",
-                hover_color="#1e3050",
+                hover_color="#283e60",
                 text_color=COLOR_TEXT,
+                corner_radius=RADIUS_BUTTON,
                 command=lambda p=page_id: self._show_page(p),
             )
             btn.pack(fill="x", padx=10, pady=2)
@@ -585,8 +591,21 @@ class WalletApp(ctk.CTk):
             fg_color="transparent",
             hover_color="#5c1a1a",
             text_color=COLOR_TEXT_DIM,
+            corner_radius=RADIUS_BUTTON,
             command=self._on_close,
         ).pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+
+        # Info-Button direkt darüber – öffnet Dialog, keine Seitennavigation
+        ctk.CTkButton(
+            self.sidebar, text="ℹ️  Info",
+            font=ctk.CTkFont(size=14),
+            height=40, anchor="w",
+            fg_color="transparent",
+            hover_color="#283e60",
+            text_color=COLOR_TEXT_DIM,
+            corner_radius=RADIUS_BUTTON,
+            command=self._show_info_dialog,
+        ).pack(side="bottom", fill="x", padx=10, pady=(0, 2))
 
     def _build_content_area(self):
         """Hauptinhalt mit Platz fuer Tab-Leiste."""
@@ -3775,6 +3794,115 @@ class WalletApp(ctk.CTk):
     # Wallet speichern
     # ──────────────────────────────────────
 
+
+    def _show_info_dialog(self):
+        """
+        Info-Dialog: App-Version, geladene Wallet-Slots, Pfade.
+
+        Bewusst kompakt und kein Diagnose-Doppelgänger – für die ausführliche
+        technische Diagnose existiert _show_debug_info().
+        """
+        import platform as _platform
+        import sys as _sys
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Info – {APP_NAME}")
+        dialog.geometry("560x520")
+        dialog.configure(fg_color=COLOR_BG)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # Header
+        ctk.CTkLabel(
+            dialog, text=f"ℹ️  {APP_NAME}  v{APP_VERSION}",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=COLOR_ACCENT,
+        ).pack(pady=(15, 4))
+        ctk.CTkLabel(
+            dialog, text=COPYRIGHT + "  ·  " + LICENSE_INFO,
+            font=ctk.CTkFont(size=11),
+            text_color=COLOR_TEXT_DIM,
+        ).pack(pady=(0, 10))
+
+        # Inhalt
+        text = ctk.CTkTextbox(
+            dialog, height=380,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            corner_radius=RADIUS_CARD,
+        )
+        text.pack(fill="both", expand=True, padx=15, pady=5)
+
+        lines: list[str] = []
+        lines.append("─── System ──────────────────────────────────────")
+        lines.append(f"Python    : {_sys.version.split()[0]}")
+        lines.append(f"Plattform : {_platform.platform()}")
+        lines.append(f"Projekt   : {PROJECT_ROOT}")
+        lines.append("")
+
+        lines.append("─── Geöffnete Wallets ───────────────────────────")
+        any_loaded = False
+        for i, slot in enumerate(self._wallet_slots):
+            if not slot.get("loaded") and not slot.get("dat_file"):
+                continue
+            any_loaded = True
+            marker = "●" if slot.get("loaded") else "○"
+            name = slot.get("name", f"Wallet-{i+1}")
+            dat = slot.get("dat_file") or "(kein Pfad gespeichert)"
+            lines.append(f"{marker} Slot {i+1}: {name}")
+            lines.append(f"    Datei : {dat}")
+
+            if dat and dat != "(kein Pfad gespeichert)":
+                state_path = str(dat) + ".state.json"
+                exists = os.path.exists(state_path)
+                lines.append(f"    State : {state_path}  [{'gefunden' if exists else 'noch nicht angelegt'}]")
+
+            wm = slot.get("wm")
+            if wm and wm.doi:
+                try:
+                    info = wm.doi.info()
+                    lines.append(
+                        f"    Netz  : {info.get('network','?')}  "
+                        f"|  Adressen: {info.get('total_addresses','?')}  "
+                        f"(receive={info.get('receive_addresses','?')}, "
+                        f"change={info.get('change_addresses','?')})"
+                    )
+                    last_disc = info.get("last_discover")
+                    if last_disc:
+                        lines.append(f"    Discovery: {last_disc}")
+                except Exception as e:
+                    lines.append(f"    (Wallet-Info-Fehler: {e})")
+
+                # DOI-Saldo, falls verbunden – cache-basiert, keine neue Abfrage
+                bal_cache = getattr(wm.doi, "_balance_cache", {}) or {}
+                if bal_cache:
+                    try:
+                        total_sat = sum(b.get("confirmed", 0) + b.get("unconfirmed", 0)
+                                        for b in bal_cache.values())
+                        from src.wallet.crypto_utils import satoshi_to_doi
+                        lines.append(f"    Saldo : {satoshi_to_doi(total_sat):.8f} DOI")
+                    except Exception:
+                        pass
+            lines.append("")
+
+        if not any_loaded:
+            lines.append("  (Keine Wallets geladen)")
+            lines.append("")
+
+        lines.append("─── Quellen ─────────────────────────────────────")
+        lines.append(f"GitHub: {GITHUB_URL}")
+
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+
+        # Close-Button
+        ctk.CTkButton(
+            dialog, text="Schliessen",
+            font=ctk.CTkFont(size=13),
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+            corner_radius=RADIUS_BUTTON,
+            command=dialog.destroy,
+        ).pack(pady=(8, 14), padx=15, fill="x")
 
     def _show_debug_info(self):
         """Zeigt Diagnose-Informationen zum aktuellen Wallet."""
