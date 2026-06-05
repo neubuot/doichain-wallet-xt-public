@@ -2533,39 +2533,46 @@ class WalletApp(ctk.CTk):
                 anchor="w",
             ).pack(fill="x", padx=14, pady=(0, 4))
 
-        # Klick-Logik (v0.9.6):
-        #  - auf TX-Hash-Label  → Hash in Zwischenablage + kurzes "kopiert!"
-        #  - sonst auf der Karte → Notiz bearbeiten
-        # Hinweis: e.widget ist bei CTkLabel das INNERE tk.Label, nicht das
-        # CTk-Wrapper-Objekt. Ein direkter Vergleich e.widget == hl schlaegt
-        # daher fehl. Wir wandern stattdessen die Master-Kette hoch.
+        # Klick-Logik (v0.9.6 / Korrektur):
+        # Tkinter propagiert <Button-1> NICHT automatisch zu Parent-Widgets.
+        # Wir binden deshalb explizit rekursiv auf jedes Widget der Karte –
+        # mit dem TX-Hash-Label als Sonderfall (Hash kopieren).
         if tx_hash:
-            def _on_click(e, h=tx_hash, hl=tx_hash_label,
-                          short=tx_hash_short if tx_hash_label else "",
-                          card_ref=card):
-                w = getattr(e, "widget", None)
-                hops = 0
-                while w is not None and w is not card_ref and hops < 8:
-                    if w is hl:
-                        self._copy_to_clipboard(h)
-                        try:
-                            hl.configure(text="📋 kopiert!", text_color=COLOR_ACCENT)
-                            self.after(1500, lambda lbl=hl, txt=short:
-                                       lbl.configure(text=txt, text_color=COLOR_TEXT_DIM))
-                        except Exception:
-                            pass
-                        return "break"
-                    try:
-                        w = w.master
-                    except AttributeError:
-                        break
-                    hops += 1
+            def _on_hash_click(e, h=tx_hash, lbl=tx_hash_label,
+                               short=tx_hash_short if tx_hash_label else ""):
+                self._copy_to_clipboard(h)
+                try:
+                    lbl.configure(text="📋 kopiert!", text_color=COLOR_ACCENT)
+                    self.after(1500, lambda l=lbl, t=short:
+                               l.configure(text=t, text_color=COLOR_TEXT_DIM))
+                except Exception:
+                    pass
+                return "break"
+
+            def _on_card_click(e, h=tx_hash):
                 self._edit_tx_note(h)
                 return "break"
 
-            card.bind("<Button-1>", _on_click)
-            for child in card.winfo_children():
-                child.bind("<Button-1>", _on_click)
+            # Sonderfall: das TX-Hash-Label fängt selbst (eigener Handler)
+            if tx_hash_label is not None:
+                tx_hash_label.bind("<Button-1>", _on_hash_click)
+
+            # Alles übrige in der Karte → Notiz bearbeiten
+            def _bind_card_clicks(w, skip=tx_hash_label):
+                if w is skip:
+                    return
+                try:
+                    w.bind("<Button-1>", _on_card_click)
+                except Exception:
+                    pass
+                try:
+                    children = w.winfo_children()
+                except Exception:
+                    children = []
+                for c in children:
+                    _bind_card_clicks(c, skip)
+
+            _bind_card_clicks(card)
 
     # ── Exchange ──
 
