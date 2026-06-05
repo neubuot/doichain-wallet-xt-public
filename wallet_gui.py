@@ -1051,6 +1051,9 @@ class WalletApp(ctk.CTk):
             self._refresh_dashboard()
         elif page_id == "exchange":
             self._refresh_exchange()
+        elif page_id == "receive":
+            # v0.9.6: jeder Tab-Aufruf erzeugt eine neue DOI-Empfangsadresse
+            self._update_receive_page(generate_new=True)
         elif page_id == "history":
             # Nur beim ersten Besuch automatisch laden
             if not self._hist_data:
@@ -1280,15 +1283,25 @@ class WalletApp(ctk.CTk):
             text_color=COLOR_TEXT, anchor="w",
         ).pack(fill="x", pady=(5, 10))
 
-        # DOI Adresse
-        self._recv_doi_frame = self._make_address_card(scroll, "DOI", COLOR_DOI)
+        # DOI Adresse (v0.9.6: mit Refresh-Button, jeder Aufruf eine neue Adresse)
+        self._recv_doi_frame = self._make_address_card(scroll, "DOI", COLOR_DOI, with_refresh=True)
         # Tron Adresse
         self._recv_tron_frame = self._make_address_card(scroll, "Tron (TRX/USDT)", COLOR_TRX)
         # ETH Adresse
         self._recv_eth_frame = self._make_address_card(scroll, "Ethereum (ETH/wDOI)", COLOR_ETH)
 
-    def _make_address_card(self, parent, label, color):
-        card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=10)
+        # Privacy-Hinweis fuer die DOI-Empfangs-Logik
+        ctk.CTkLabel(
+            scroll,
+            text="ℹ️  Jeder Aufruf dieser Seite zeigt eine neue DOI-Empfangsadresse "
+                 "(BIP-44, mehr Privatsphäre). Frühere Adressen bleiben gültig.",
+            font=ctk.CTkFont(size=11),
+            text_color=COLOR_TEXT_DIM,
+            wraplength=600, justify="left",
+        ).pack(fill="x", pady=(4, 10), padx=4)
+
+    def _make_address_card(self, parent, label, color, with_refresh=False):
+        card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=RADIUS_CARD)
         card.pack(fill="x", pady=(0, 10))
 
         header = ctk.CTkFrame(card, fg_color="transparent")
@@ -1300,6 +1313,16 @@ class WalletApp(ctk.CTk):
             text_color=color,
         ).pack(side="left")
 
+        # Index-Label rechts im Header (v0.9.6, nur fuer DOI)
+        index_label = None
+        if with_refresh:
+            index_label = ctk.CTkLabel(
+                header, text="",
+                font=ctk.CTkFont(size=11),
+                text_color=COLOR_TEXT_DIM,
+            )
+            index_label.pack(side="right")
+
         addr_label = ctk.CTkLabel(
             card, text="–",
             font=ctk.CTkFont(family="Consolas", size=15),
@@ -1307,39 +1330,83 @@ class WalletApp(ctk.CTk):
         )
         addr_label.pack(padx=15, pady=(0, 3))
 
+        # Button-Reihe (Kopieren + optional Refresh)
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(pady=(0, 10))
+
         copy_btn = ctk.CTkButton(
-            card, text="📋 Kopieren", height=30, width=120,
+            btn_row, text="📋 Kopieren", height=30, width=120,
             font=ctk.CTkFont(size=12),
             fg_color="transparent", hover_color="#2a3a5c",
             border_width=1, border_color=COLOR_ACCENT,
+            corner_radius=RADIUS_BUTTON,
         )
-        copy_btn.pack(pady=(0, 10))
+        copy_btn.pack(side="left", padx=4)
+
+        refresh_btn = None
+        if with_refresh:
+            refresh_btn = ctk.CTkButton(
+                btn_row, text="🔄 Neue Adresse", height=30, width=140,
+                font=ctk.CTkFont(size=12),
+                fg_color="transparent", hover_color="#2a3a5c",
+                border_width=1, border_color=COLOR_TEXT_DIM,
+                corner_radius=RADIUS_BUTTON,
+            )
+            refresh_btn.pack(side="left", padx=4)
 
         # QR placeholder
         qr_label = ctk.CTkLabel(card, text="")
         qr_label.pack(pady=(0, 10))
 
-        return {"card": card, "addr_label": addr_label, "copy_btn": copy_btn, "qr_label": qr_label}
+        return {
+            "card": card, "addr_label": addr_label,
+            "copy_btn": copy_btn, "refresh_btn": refresh_btn,
+            "qr_label": qr_label, "index_label": index_label,
+        }
 
-    def _update_receive_page(self):
+    def _update_receive_page(self, generate_new=False):
         if not self.wm:
             return
 
-        addrs = self.wm.primary_addresses
-        doi_addr = addrs.get("doi", "–")
-        tron_addr = addrs.get("tron", "–")
-        eth_addr = addrs.get("eth", "–")
+        # DOI: optional eine frische Adresse generieren (v0.9.6: bei jedem Tab-Aufruf)
+        doi_idx = None
+        if generate_new and self.wm.doi:
+            try:
+                doi_addr = self.wm.doi.get_new_receive_address()
+                doi_idx = self.wm.doi._receive_index - 1
+                # Index persistieren, damit Restart nichts verliert
+                try:
+                    self.wm.save_state()
+                except Exception:
+                    pass
+            except Exception:
+                doi_addr = self.wm.primary_addresses.get("doi", "–")
+        else:
+            doi_addr = self.wm.primary_addresses.get("doi", "–")
+            doi_idx = 0  # Standard-Adresse ist Index 0
+
+        tron_addr = self.wm.primary_addresses.get("tron", "–")
+        eth_addr = self.wm.primary_addresses.get("eth", "–")
 
         self._recv_doi_frame["addr_label"].configure(text=doi_addr)
         self._recv_tron_frame["addr_label"].configure(text=tron_addr)
         self._recv_eth_frame["addr_label"].configure(text=eth_addr)
 
+        # Index in der Ecke anzeigen (nur DOI)
+        if self._recv_doi_frame.get("index_label") is not None and doi_idx is not None:
+            self._recv_doi_frame["index_label"].configure(text=f"Adresse #{doi_idx}")
+
         self._recv_doi_frame["copy_btn"].configure(
-            command=lambda: self._copy_to_clipboard(doi_addr))
+            command=lambda a=doi_addr: self._copy_to_clipboard(a))
         self._recv_tron_frame["copy_btn"].configure(
             command=lambda: self._copy_to_clipboard(tron_addr))
         self._recv_eth_frame["copy_btn"].configure(
             command=lambda: self._copy_to_clipboard(eth_addr))
+
+        # Refresh-Button verdrahten (nur DOI hat einen)
+        refresh_btn = self._recv_doi_frame.get("refresh_btn")
+        if refresh_btn is not None:
+            refresh_btn.configure(command=lambda: self._update_receive_page(generate_new=True))
 
         # QR-Codes generieren
         if HAS_QR:
@@ -2371,14 +2438,18 @@ class WalletApp(ctk.CTk):
             text_color=dir_color,
         ).pack(anchor="e")
 
-        # TX-Hash (gekürzt)
+        # TX-Hash (gekuerzt) – klickbar zum Kopieren (v0.9.6)
         tx_hash = tx.get("hash", "")
+        tx_hash_label = None
         if tx_hash:
-            ctk.CTkLabel(
-                right, text=shorten_addr(tx_hash, 8),
+            tx_hash_short = shorten_addr(tx_hash, 8)
+            tx_hash_label = ctk.CTkLabel(
+                right, text=tx_hash_short,
                 font=ctk.CTkFont(family="Consolas", size=10),
                 text_color=COLOR_TEXT_DIM,
-            ).pack(anchor="e")
+                cursor="hand2",
+            )
+            tx_hash_label.pack(anchor="e")
 
         # Notiz anzeigen (falls vorhanden)
         if tx_hash and tx_hash in self._tx_notes:
@@ -2389,11 +2460,26 @@ class WalletApp(ctk.CTk):
                 anchor="w",
             ).pack(fill="x", padx=14, pady=(0, 4))
 
-        # Klick auf Karte → Notiz bearbeiten
+        # Klick-Logik (v0.9.6):
+        #  - auf TX-Hash-Label  → Hash in Zwischenablage + kurzes "kopiert!"
+        #  - sonst auf der Karte → Notiz bearbeiten
         if tx_hash:
-            card.bind("<Button-1>", lambda e, h=tx_hash: self._edit_tx_note(h))
+            def _on_click(e, h=tx_hash, hl=tx_hash_label, short=tx_hash_short if tx_hash_label else ""):
+                if hl is not None and e.widget == hl:
+                    self._copy_to_clipboard(h)
+                    try:
+                        hl.configure(text="📋 kopiert!", text_color=COLOR_ACCENT)
+                        self.after(1500, lambda lbl=hl, txt=short:
+                                   lbl.configure(text=txt, text_color=COLOR_TEXT_DIM))
+                    except Exception:
+                        pass
+                    return "break"
+                self._edit_tx_note(h)
+                return "break"
+
+            card.bind("<Button-1>", _on_click)
             for child in card.winfo_children():
-                child.bind("<Button-1>", lambda e, h=tx_hash: self._edit_tx_note(h))
+                child.bind("<Button-1>", _on_click)
 
     # ── Exchange ──
 
@@ -3213,14 +3299,31 @@ class WalletApp(ctk.CTk):
                 except Exception:
                     pass
 
-        # Block-Hoehen aktualisieren
+        # Block-Hoehen aktualisieren (v0.9.6: get_server_info gibt's nicht mehr,
+        # nutze get_tip aus v0.9.5 + History-Max als Fallback)
         for slot in self._wallet_slots:
             if slot["loaded"] and slot["wm"]:
                 try:
                     if slot["wm"].doi and slot["wm"].doi.electrum:
-                        info = slot["wm"].doi.electrum.get_server_info()
-                        if isinstance(info, dict) and "height" in info:
-                            self._block_heights["doi"] = info["height"]
+                        ec = slot["wm"].doi.electrum
+                        h = 0
+                        try:
+                            tip = ec.get_tip()
+                            if isinstance(tip, dict) and tip.get("height", 0) > 0:
+                                h = tip["height"]
+                        except Exception:
+                            pass
+                        if h == 0:
+                            # Fallback: max height aus History
+                            try:
+                                hist = slot["wm"].doi.get_history()
+                                if isinstance(hist, list):
+                                    h = max((tx.get("height", 0) for tx in hist
+                                             if tx.get("height", 0) > 0), default=0)
+                            except Exception:
+                                pass
+                        if h > 0:
+                            self._block_heights["doi"] = h
                 except Exception:
                     pass
                 try:
@@ -3329,35 +3432,30 @@ class WalletApp(ctk.CTk):
             text=self._get_conn_text(), text_color=COLOR_TEXT_DIM))
 
         # Block-Hoehen aktualisieren (DOI)
+        # v0.9.6: get_server_info()/_client.call existieren nicht in unserem Client.
+        # Nutze stattdessen das in v0.9.5 ergaenzte get_tip().
         try:
             if self.wm and self.wm.doi and self.wm.doi.electrum:
                 ec = self.wm.doi.electrum
-                # Versuch 1: server_info
+                h = 0
+                # Primaer: get_tip (blockchain.headers.subscribe)
                 try:
-                    si = ec.get_server_info()
-                    if isinstance(si, dict) and "height" in si:
-                        self._block_heights["doi"] = si["height"]
+                    tip = ec.get_tip()
+                    if isinstance(tip, dict) and tip.get("height", 0) > 0:
+                        h = tip["height"]
                 except Exception:
                     pass
-                # Versuch 2: headers.subscribe
-                if self._block_heights["doi"] == 0:
-                    try:
-                        if hasattr(ec, "_client") and ec._client:
-                            tip = ec._client.call("blockchain.headers.subscribe")
-                            if isinstance(tip, dict):
-                                self._block_heights["doi"] = tip.get("height", tip.get("block_height", 0))
-                    except Exception:
-                        pass
-                # Versuch 3: hoechsten Block aus History
-                if self._block_heights["doi"] == 0:
+                # Fallback: max height aus eigener TX-History
+                if h == 0:
                     try:
                         hist = self.wm.doi.get_history()
                         if isinstance(hist, list):
-                            max_h = max((tx.get("height", 0) for tx in hist if tx.get("height", 0) > 0), default=0)
-                            if max_h > 0:
-                                self._block_heights["doi"] = max_h
+                            h = max((tx.get("height", 0) for tx in hist
+                                     if tx.get("height", 0) > 0), default=0)
                     except Exception:
                         pass
+                if h > 0:
+                    self._block_heights["doi"] = h
         except Exception:
             pass
         try:
