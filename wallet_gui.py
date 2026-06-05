@@ -754,6 +754,10 @@ class WalletApp(ctk.CTk):
         self._update_addresses()
         self._update_receive_page()
         self._refresh_dashboard()
+        # v0.9.6: bei Slot-Wechsel auch History neu laden, sonst sieht der User
+        # einen alten Snapshot des neuen Slots (z.B. ohne die soeben getaetigte Tx).
+        if getattr(self, "_current_page", None) == "history":
+            self._refresh_history_async()
 
     def _save_slot_state(self, index):
         """Speichert den aktuellen State in einen Slot."""
@@ -2327,6 +2331,9 @@ class WalletApp(ctk.CTk):
                     "timestamp": int(ts),
                     "from": from_hex,
                     "to": to_hex,
+                    # v0.9.6: block-Feld aus TronGrid-Antwort uebernehmen,
+                    # sonst zeigt _make_tx_card immer "Unbestaetigt"
+                    "block": tx.get("blockNumber", tx.get("block_number", 0)),
                 }
 
             # ── USDT (TRC-20 Token-Transfer) ──
@@ -2372,6 +2379,8 @@ class WalletApp(ctk.CTk):
                     "timestamp": int(ts),
                     "from": from_addr,
                     "to": to_addr,
+                    # v0.9.6: gleicher Fix wie TRX
+                    "block": tx.get("blockNumber", tx.get("block_number", 0)),
                 }
 
             return None
@@ -2527,17 +2536,30 @@ class WalletApp(ctk.CTk):
         # Klick-Logik (v0.9.6):
         #  - auf TX-Hash-Label  → Hash in Zwischenablage + kurzes "kopiert!"
         #  - sonst auf der Karte → Notiz bearbeiten
+        # Hinweis: e.widget ist bei CTkLabel das INNERE tk.Label, nicht das
+        # CTk-Wrapper-Objekt. Ein direkter Vergleich e.widget == hl schlaegt
+        # daher fehl. Wir wandern stattdessen die Master-Kette hoch.
         if tx_hash:
-            def _on_click(e, h=tx_hash, hl=tx_hash_label, short=tx_hash_short if tx_hash_label else ""):
-                if hl is not None and e.widget == hl:
-                    self._copy_to_clipboard(h)
+            def _on_click(e, h=tx_hash, hl=tx_hash_label,
+                          short=tx_hash_short if tx_hash_label else "",
+                          card_ref=card):
+                w = getattr(e, "widget", None)
+                hops = 0
+                while w is not None and w is not card_ref and hops < 8:
+                    if w is hl:
+                        self._copy_to_clipboard(h)
+                        try:
+                            hl.configure(text="📋 kopiert!", text_color=COLOR_ACCENT)
+                            self.after(1500, lambda lbl=hl, txt=short:
+                                       lbl.configure(text=txt, text_color=COLOR_TEXT_DIM))
+                        except Exception:
+                            pass
+                        return "break"
                     try:
-                        hl.configure(text="📋 kopiert!", text_color=COLOR_ACCENT)
-                        self.after(1500, lambda lbl=hl, txt=short:
-                                   lbl.configure(text=txt, text_color=COLOR_TEXT_DIM))
-                    except Exception:
-                        pass
-                    return "break"
+                        w = w.master
+                    except AttributeError:
+                        break
+                    hops += 1
                 self._edit_tx_note(h)
                 return "break"
 
@@ -3714,6 +3736,9 @@ class WalletApp(ctk.CTk):
                 # Salden aktualisieren
                 self._load_balances()
                 self.after(500, self._refresh_dashboard)
+                # v0.9.6: History async neu laden – damit die soeben gesendete
+                # Tx in der Transaktionsliste als unbestätigt erscheint
+                self.after(800, self._refresh_history_async)
             except Exception as e:
                 self.after(0, lambda: self._send_status.configure(
                     text=f"❌ {e}", text_color=COLOR_ERROR,
