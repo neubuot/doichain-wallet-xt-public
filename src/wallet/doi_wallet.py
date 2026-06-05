@@ -409,6 +409,53 @@ class DoiWallet:
             "doi": satoshi_to_doi(balance["total"]),
         }
 
+    def validate_unconfirmed(self) -> dict:
+        """
+        Prüft, ob alle gecachten 'unbestätigten' Salden noch Server-Realität sind.
+
+        Hintergrund: Bei DOI können Mempool-TXs aus drei Gründen 'verschwinden':
+          1. Sie wurden in einem Block bestätigt (häufigste Fall).
+          2. Sie wurden vom Server-Mempool evictet (Hashpower-Crash → langer Stau).
+          3. Sie wurden ersetzt (RBF).
+        In all diesen Fällen meldet der Server ab sofort unconfirmed=0, aber
+        unser lokaler Cache hält den alten Wert. Diese Methode entdeckt das.
+
+        Nur Adressen mit cached unconfirmed != 0 werden tatsächlich abgefragt –
+        das sind in der Praxis wenige Adressen, die Methode ist also günstig.
+
+        Returns: Diagnose-Dict
+            {
+              'checked':     int   # Wie viele Adressen mit cached unconfirmed wurden geprüft
+              'invalidated': int   # Wie viele davon waren stale → Cache aktualisiert
+              'errors':      int   # Wie viele konnten nicht abgefragt werden
+              'addresses':   list  # Liste der invalidierten Adressen (für Logging)
+            }
+        """
+        result = {"checked": 0, "invalidated": 0, "errors": 0, "addresses": []}
+        if not self.electrum:
+            return result
+
+        for addr, cached in list(self._balance_cache.items()):
+            if cached.get("unconfirmed", 0) == 0:
+                continue
+            result["checked"] += 1
+            try:
+                fresh = self.electrum.get_balance(addr)
+            except (ConnectionError, RuntimeError) as e:
+                logger.warning("validate_unconfirmed: %s fehlgeschlagen: %s", addr, e)
+                result["errors"] += 1
+                continue
+            if fresh.get("unconfirmed", 0) != cached.get("unconfirmed", 0):
+                self._balance_cache[addr] = fresh
+                result["invalidated"] += 1
+                result["addresses"].append(addr)
+                logger.info(
+                    "validate_unconfirmed: %s aktualisiert "
+                    "(cached unconfirmed=%s → server=%s)",
+                    addr, cached.get("unconfirmed"), fresh.get("unconfirmed")
+                )
+        return result
+
     def get_utxos(self, force_refresh: bool = False) -> list:
         """Gibt alle UTXOs des Wallets zurück."""
         self._ensure_connected()

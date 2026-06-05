@@ -505,6 +505,12 @@ class WalletApp(ctk.CTk):
         self._tab_scroll_offset = 0
         self._block_heights = {"doi": 0, "eth": 0}  # Aktuelle Block-Hoehen
 
+        # v0.9.6: Auto-Refresh-Timer fuer die TX-Liste (60s, nur waehrend
+        # der "history"-Tab sichtbar ist)
+        self._current_page: str = "dashboard"
+        self._history_autorefresh_id = None
+        self.HISTORY_AUTOREFRESH_MS = 60_000  # 60 Sekunden
+
         # Killer Features
         self._tx_notes = {}       # {tx_hash: "notiz"}
         self._daily_limit_eur = 0  # 0 = kein Limit
@@ -1046,8 +1052,14 @@ class WalletApp(ctk.CTk):
             else:
                 frame.pack_forget()
 
+        # v0.9.6: aktuellen Page-Namen merken (fuer Auto-Refresh-Timer)
+        self._current_page = page_id
+
         # Refresh bei Seitenwechsel
         if page_id == "dashboard":
+            # Cache-Hygiene: alte Mempool-Eintraege koennen inzwischen bestaetigt
+            # oder evictet sein – Dashboard frisch validieren bevor Salden angezeigt
+            self._validate_unconfirmed_async()
             self._refresh_dashboard()
         elif page_id == "exchange":
             self._refresh_exchange()
@@ -1055,11 +1067,63 @@ class WalletApp(ctk.CTk):
             # v0.9.6: jeder Tab-Aufruf erzeugt eine neue DOI-Empfangsadresse
             self._update_receive_page(generate_new=True)
         elif page_id == "history":
-            # Nur beim ersten Besuch automatisch laden
-            if not self._hist_data:
+            # v0.9.6: jeder Tab-Aufruf triggert frischen Fetch (war: nur bei leerem Cache)
+            self._refresh_history_async()
+
+        # v0.9.6: Auto-Refresh nur waehrend "history" sichtbar
+        self._tick_history_autorefresh()
+
+    def _tick_history_autorefresh(self):
+        """
+        Startet/stoppt den 60-Sekunden-Auto-Refresh der TX-Liste in Abhaengigkeit
+        davon, ob der "history"-Tab gerade aktiv ist. Wird bei jedem Page-Wechsel
+        aufgerufen und nach jeder eigenen Iteration via self.after() erneut.
+        """
+        # Alten geplanten Aufruf aufraeumen
+        if self._history_autorefresh_id is not None:
+            try:
+                self.after_cancel(self._history_autorefresh_id)
+            except Exception:
+                pass
+            self._history_autorefresh_id = None
+
+        # Nur weiterticken, wenn wir auf dem history-Tab sind
+        if self._current_page != "history":
+            return
+
+        def _tick():
+            self._history_autorefresh_id = None
+            if self._current_page != "history":
+                return  # User hat inzwischen gewechselt
+            try:
                 self._refresh_history_async()
-            else:
-                self._render_history()
+            except Exception:
+                pass
+            # Neu schedulen
+            self._tick_history_autorefresh()
+
+        self._history_autorefresh_id = self.after(self.HISTORY_AUTOREFRESH_MS, _tick)
+
+    def _validate_unconfirmed_async(self):
+        """
+        Stoesst eine Validierung der gecachten unconfirmed-Salden im Hintergrund an.
+
+        Stille Operation – kein UI-Feedback, ausser die Dashboard-Werte aktualisieren
+        sich kurz nach Tab-Wechsel auf 'dashboard' selbsttaetig.
+        """
+        if not self.wm or not self.wm.doi:
+            return
+
+        def _do():
+            try:
+                result = self.wm.doi.validate_unconfirmed()
+                if result.get("invalidated", 0) > 0:
+                    # Dashboard nach Cache-Update neu rendern
+                    self.after(0, self._refresh_dashboard)
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ──────────────────────────────────────
     # Seiten erstellen
