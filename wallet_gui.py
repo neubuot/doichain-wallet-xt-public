@@ -56,7 +56,7 @@ except ImportError:
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
@@ -1619,6 +1619,25 @@ class WalletApp(ctk.CTk):
                         data["doi"] = []
                 else:
                     data["doi"] = []
+                # v0.9.6.6: Reconcile - falls Enrich TXs schluckt, Platzhalter anlegen
+                if isinstance(doi_hist, list) and isinstance(data.get("doi"), list):
+                    _enriched_hashes = {_e.get("hash", "") for _e in data["doi"] if isinstance(_e, dict)}
+                    for _raw in doi_hist:
+                        if not isinstance(_raw, dict):
+                            continue
+                        _rh = _raw.get("tx_hash", "")
+                        if _rh and _rh not in _enriched_hashes:
+                            data["doi"].append({
+                                "hash": _rh,
+                                "direction": "unknown",
+                                "value": 0,
+                                "symbol": "DOI",
+                                "timestamp": 0,
+                                "from": "",
+                                "to": "",
+                                "block": _raw.get("height", 0),
+                            })
+
                 print(f"[DEBUG] DOI-History: {len(data.get('doi',[]))} TXs (enriched)")
             except Exception as e:
                 import traceback
@@ -1891,7 +1910,7 @@ class WalletApp(ctk.CTk):
         print(f"[DEBUG] ETH-RPC: {len(result)} unique ETH-TXs")
         return result
 
-    def _enrich_doi_history(self, raw_history: list, max_txs: int = 20) -> list:
+    def _enrich_doi_history(self, raw_history: list, max_txs: int = 200) -> list:
         """
         Reichert DOI-Transaktionen mit Beträgen an via ElectrumX get_transaction.
 

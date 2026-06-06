@@ -195,6 +195,8 @@ class ElectrumXClient:
                 self._setup_keepalive(self._socket)
 
                 ctx = self._build_ssl_context()
+                if self._socket is None:
+                    raise ConnectionError(f"create_connection({host}:{port}) lieferte None")
                 self._ssl_socket = ctx.wrap_socket(self._socket, server_hostname=host)
                 self._ssl_socket.connect((host, port))
 
