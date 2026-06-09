@@ -21,6 +21,7 @@ wallet.dat
 wallet-*.dat
 tx_notes.json
 daily_sends.json
+tab_config.json
 
 # IDE / OS
 .idea/

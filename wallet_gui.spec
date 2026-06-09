@@ -23,16 +23,21 @@ import customtkinter
 ctk_path = os.path.dirname(customtkinter.__file__)
 datas.append((ctk_path, 'customtkinter'))
 
-# Config-Datei (falls vorhanden)
-config_path = os.path.join(PROJECT_ROOT, 'config', 'config.yaml')
-if os.path.exists(config_path):
-    datas.append(('config', 'config'))
+# Beispiel-Config einbinden (falls vorhanden).
+# WICHTIG: NIEMALS die echte config.yaml bundeln – sie enthaelt API-Keys/Secrets!
+example_config = os.path.join(PROJECT_ROOT, 'config', 'config.example.yaml')
+if os.path.exists(example_config):
+    datas.append((example_config, 'config'))
 
 # certifi CA-Zertifikate
 import certifi
 datas.append((certifi.where(), 'certifi'))
 
-# Mnemonic BIP-39 Wortlisten
+# Mnemonic BIP-39 Wortlisten – die Library laedt sie relativ zu
+# os.path.dirname(mnemonic.__file__)/wordlist/<sprache>.txt, im Frozen-Build
+# also aus sys._MEIPASS/mnemonic/wordlist. Das Bundling hier genuegt;
+# der fruehere Runtime-Hook (rthook_mnemonic.py) setzte ein nicht
+# existierendes Attribut (Mnemonic.WORDLIST_DIR) und war ein No-op.
 import mnemonic as _mn
 import os as _os
 _mnpath = _os.path.join(_os.path.dirname(_mn.__file__), 'wordlist')
@@ -93,7 +98,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['rthook_mnemonic.py'],
+    runtime_hooks=[],
     excludes=[
         'matplotlib', 'numpy', 'scipy', 'pandas',
         'tkinter.test', 'unittest', 'pytest',

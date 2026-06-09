@@ -14,12 +14,16 @@ https://github.com/neubuot/doichain-wallet-xt
 import os
 import sys
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 import customtkinter as ctk
+
+# Zentrales Logging statt print("[DEBUG]...") – Level via config general.log_level
+logger = logging.getLogger(__name__)
 
 # QR-Code Support
 try:
@@ -56,7 +60,7 @@ except ImportError:
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.6"
+APP_VERSION = "0.9.7"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
@@ -90,15 +94,15 @@ def load_config():
     """Lädt config.yaml (fehlertolerant)."""
     try:
         config_path = PROJECT_ROOT / "config" / "config.yaml"
-        print(f"[DEBUG] load_config → {config_path} (exists={config_path.exists()})")
+        logger.debug(f"load_config → {config_path} (exists={config_path.exists()})")
         if config_path.exists():
             import yaml
             with open(config_path, "r") as f:
                 data = yaml.safe_load(f) or {}
-            print(f"[DEBUG] load_config OK, keys={list(data.keys())}")
+            logger.debug(f"load_config OK, keys={list(data.keys())}")
             return data
     except Exception as e:
-        print(f"[DEBUG] load_config FEHLER: {e}")
+        logger.debug(f"load_config FEHLER: {e}")
     return {}
 
 
@@ -108,15 +112,27 @@ def save_config(config: dict):
         config_dir = PROJECT_ROOT / "config"
         config_dir.mkdir(exist_ok=True)
         config_path = config_dir / "config.yaml"
-        print(f"[DEBUG] save_config → {config_path}")
+        logger.debug(f"save_config → {config_path}")
         import yaml
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
-        print(f"[DEBUG] save_config OK")
+        logger.debug(f"save_config OK")
         return True
     except Exception as e:
-        print(f"[DEBUG] save_config FEHLER: {e}")
+        logger.debug(f"save_config FEHLER: {e}")
         return False
+
+
+def setup_logging():
+    """Konfiguriert das Logging-Level aus config general.log_level (Default: WARNING)."""
+    level_name = str(
+        load_config().get("general", {}).get("log_level", "WARNING")
+    ).upper()
+    level = getattr(logging, level_name, logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 # ──────────────────────────────────────────────
@@ -511,6 +527,24 @@ class WalletApp(ctk.CTk):
         self._history_autorefresh_id = None
         self.HISTORY_AUTOREFRESH_MS = 60_000  # 60 Sekunden
 
+        # Generationszaehler gegen ueberlappende History-Refreshes:
+        # nur das Ergebnis der juengsten Generation wird uebernommen.
+        self._hist_gen = 0
+        self._hist_loading = False
+
+        # In-Memory-Cache fuer geladene Roh-Transaktionen (txid → verbose dict).
+        # Bestaetigte TXs sind unveraenderlich, daher chain-global cachebar –
+        # spart beim 60s-Auto-Refresh dutzende ElectrumX-Roundtrips.
+        self._tx_cache = {}
+
+        # Sauberes Beenden: Worker duerfen nach Fenster-Schliessen kein
+        # self.after() mehr aufrufen; laufende Sends werden abgefragt.
+        self._closing = False
+        self._send_in_progress = False
+
+        # Verzoegerter Einzelklick auf Wallet-Tabs (Doppelklick = Umbenennen)
+        self._tab_click_after_id = None
+
         # Killer Features
         self._tx_notes = {}       # {tx_hash: "notiz"}
         self._daily_limit_eur = 0  # 0 = kein Limit
@@ -731,8 +765,44 @@ class WalletApp(ctk.CTk):
             self._tab_scroll_offset = new_offset
             self._render_visible_tabs()
 
+    def _safe_after(self, ms, callback):
+        """
+        after()-Wrapper fuer Hintergrund-Threads: waehrend des Beendens
+        (self._closing) werden Callbacks verworfen, damit kein Worker mehr
+        auf zerstoerte Tk-Widgets zugreift.
+        """
+        if self._closing:
+            return None
+        try:
+            return self.after(ms, callback)
+        except Exception:
+            return None
+
+    def _cancel_pending_tab_click(self):
+        """Storniert einen anstehenden (verzoegerten) Einzelklick auf einen Tab."""
+        if self._tab_click_after_id is not None:
+            try:
+                self.after_cancel(self._tab_click_after_id)
+            except Exception:
+                pass
+            self._tab_click_after_id = None
+
     def _on_tab_click(self, index):
-        """Klick auf einen Wallet-Tab."""
+        """
+        Klick auf einen Wallet-Tab.
+
+        Der eigentliche Wechsel wird ~250 ms verzoegert ausgefuehrt, damit ein
+        Doppelklick (Umbenennen) den Einzelklick stornieren kann – sonst
+        oeffnet ein Doppelklick auf einen leeren Slot faelschlich den
+        StartupDialog.
+        """
+        self._cancel_pending_tab_click()
+        self._tab_click_after_id = self.after(
+            250, lambda idx=index: self._do_tab_click(idx))
+
+    def _do_tab_click(self, index):
+        """Fuehrt den (ggf. verzoegerten) Tab-Wechsel aus."""
+        self._tab_click_after_id = None
         if index == self._active_slot:
             return
 
@@ -757,7 +827,7 @@ class WalletApp(ctk.CTk):
         # v0.9.6: bei Slot-Wechsel auch History neu laden, sonst sieht der User
         # einen alten Snapshot des neuen Slots (z.B. ohne die soeben getaetigte Tx).
         if getattr(self, "_current_page", None) == "history":
-            self._refresh_history_async()
+            self._refresh_history_async(force=True)
 
     def _save_slot_state(self, index):
         """Speichert den aktuellen State in einen Slot."""
@@ -861,6 +931,8 @@ class WalletApp(ctk.CTk):
 
     def _rename_tab(self, index):
         """Doppelklick auf Tab: Name aendern."""
+        # Anstehenden Einzelklick stornieren – Doppelklick hat Vorrang
+        self._cancel_pending_tab_click()
         dialog = ctk.CTkToplevel(self)
         dialog.title("Tab umbenennen")
         dialog.geometry("300x140")
@@ -1544,8 +1616,22 @@ class WalletApp(ctk.CTk):
         """Filter gewechselt → Anzeige aktualisieren."""
         self._render_history()
 
-    def _refresh_history_async(self):
-        """History im Hintergrund laden."""
+    def _refresh_history_async(self, force=False):
+        """
+        History im Hintergrund laden.
+
+        Schutz gegen ueberlappende Refreshes (z.B. 60s-Auto-Refresh waehrend
+        ein manueller Refresh noch laeuft): Generationszaehler – nur das
+        Ergebnis der juengsten Generation wird uebernommen. Laeuft bereits
+        ein Load, wird (ausser bei force=True) kein neuer gestartet.
+        """
+        if self._hist_loading and not force:
+            return
+        self._hist_gen += 1
+        gen = self._hist_gen
+        self._hist_loading = True
+        slot_idx = self._active_slot
+
         # Status direkt in der Liste anzeigen (alte Einträge löschen)
         for widget in self._hist_scroll.winfo_children():
             widget.destroy()
@@ -1553,7 +1639,9 @@ class WalletApp(ctk.CTk):
             self._hist_scroll, text="⏳ Lade Transaktionen...",
             font=ctk.CTkFont(size=13), text_color=COLOR_WARNING,
         ).pack(pady=20)
-        threading.Thread(target=self._load_history, daemon=True).start()
+        threading.Thread(
+            target=self._load_history, args=(slot_idx, gen), daemon=True
+        ).start()
 
     def _update_hist_status(self, text):
         """Zeigt Status-Text in der Transaktionsliste."""
@@ -1567,53 +1655,77 @@ class WalletApp(ctk.CTk):
         except Exception:
             pass
 
-    def _load_history(self):
-        """Lädt Transaktionen aller Chains (Hintergrund-Thread)."""
-        if not self.wm:
+    def _load_history(self, slot_idx=None, gen=None):
+        """
+        Lädt Transaktionen aller Chains (Hintergrund-Thread).
+
+        Slot-gebunden: wm wird beim Thread-Start eingefroren und das Ergebnis
+        in den Slot-eigenen Speicher geschrieben. Die UI wird nur aktualisiert,
+        wenn der Slot noch aktiv und die Generation noch aktuell ist – sonst
+        wuerde ein Tab-Wechsel mitten im Fetch Daten von Wallet A in Slot B
+        anzeigen/speichern.
+        """
+        if slot_idx is None:
+            slot_idx = self._active_slot
+        slot = self._wallet_slots[slot_idx]
+        wm = slot["wm"]
+
+        def _still_current():
+            return (slot_idx == self._active_slot
+                    and (gen is None or gen == self._hist_gen))
+
+        def _finish():
+            # Lade-Flag nur zuruecksetzen, wenn keine neuere Generation laeuft
+            if gen is None or gen == self._hist_gen:
+                self._hist_loading = False
+
+        if not wm:
+            self._safe_after(0, _finish)
             return
 
         data = {}
 
         # ETH + wDOI Transaktionen (RPC-basiert)
-        if self.wm.eth:
+        if wm.eth:
             # wDOI-History (Event Logs – funktioniert)
             try:
-                data["wdoi"] = self.wm.eth.get_wdoi_history(limit=20)
-                print(f"[DEBUG] wDOI-History: {len(data['wdoi'])} TXs")
+                data["wdoi"] = wm.eth.get_wdoi_history(limit=20)
+                logger.debug(f"wDOI-History: {len(data['wdoi'])} TXs")
                 if data["wdoi"]:
-                    print(f"[DEBUG] wDOI TX[0]: {data['wdoi'][0]}")
+                    logger.debug(f"wDOI TX[0]: {data['wdoi'][0]}")
             except Exception as e:
-                print(f"[DEBUG] wDOI-History Error: {e}")
+                logger.debug(f"wDOI-History Error: {e}")
                 data["wdoi"] = []
 
             # ETH-History: Rekonstruiere aus wDOI-TXs + Etherscan
             try:
-                data["eth"] = self._load_eth_history_rpc(data.get("wdoi", []))
-                print(f"[DEBUG] ETH-History (RPC): {len(data['eth'])} TXs")
+                data["eth"] = self._load_eth_history_rpc(wm, data.get("wdoi", []))
+                logger.debug(f"ETH-History (RPC): {len(data['eth'])} TXs")
             except Exception as e:
-                print(f"[DEBUG] ETH-History Error: {e}")
-                import traceback; traceback.print_exc()
+                logger.debug(f"ETH-History Error: {e}", exc_info=True)
                 data["eth"] = []
 
         # DOI-Transaktionen (mit Beträgen via ElectrumX TX-Lookup)
-        if self.wm.doi:
+        if wm.doi:
             try:
-                doi_hist = self.wm.doi.get_history()
-                print(f"[DEBUG] DOI raw history type: {type(doi_hist).__name__}")
+                doi_hist = wm.doi.get_history()
+                logger.debug(f"DOI raw history type: {type(doi_hist).__name__}")
                 if isinstance(doi_hist, list):
-                    print(f"[DEBUG] DOI raw history: {len(doi_hist)} TXs")
+                    logger.debug(f"DOI raw history: {len(doi_hist)} TXs")
                     if doi_hist:
-                        print(f"[DEBUG] DOI TX[0] keys: {list(doi_hist[0].keys()) if isinstance(doi_hist[0], dict) else 'not a dict'}")
-                    # Status-Update im UI
-                    self.after(0, lambda n=len(doi_hist): self._update_hist_status(
-                        f"⏳ Lade DOI-Beträge ({n} TXs)..."))
-                    data["doi"] = self._enrich_doi_history(doi_hist)
+                        logger.debug(f"DOI TX[0] keys: {list(doi_hist[0].keys()) if isinstance(doi_hist[0], dict) else 'not a dict'}")
+                    # Status-Update im UI (nur falls Slot/Generation noch aktuell)
+                    def _status(n=len(doi_hist)):
+                        if _still_current():
+                            self._update_hist_status(f"⏳ Lade DOI-Beträge ({n} TXs)...")
+                    self._safe_after(0, _status)
+                    data["doi"] = self._enrich_doi_history(wm, doi_hist)
                 elif isinstance(doi_hist, dict):
-                    print(f"[DEBUG] DOI raw history keys: {list(doi_hist.keys())}")
+                    logger.debug(f"DOI raw history keys: {list(doi_hist.keys())}")
                     for key in ["transactions", "txs", "history", "data"]:
                         if key in doi_hist and isinstance(doi_hist[key], list):
-                            print(f"[DEBUG] DOI raw: using dict['{key}'] with {len(doi_hist[key])} TXs")
-                            data["doi"] = self._enrich_doi_history(doi_hist[key])
+                            logger.debug(f"DOI raw: using dict['{key}'] with {len(doi_hist[key])} TXs")
+                            data["doi"] = self._enrich_doi_history(wm, doi_hist[key])
                             break
                     else:
                         data["doi"] = []
@@ -1638,33 +1750,31 @@ class WalletApp(ctk.CTk):
                                 "block": _raw.get("height", 0),
                             })
 
-                print(f"[DEBUG] DOI-History: {len(data.get('doi',[]))} TXs (enriched)")
+                logger.debug(f"DOI-History: {len(data.get('doi',[]))} TXs (enriched)")
             except Exception as e:
-                import traceback
-                print(f"[DEBUG] DOI-History Error: {e}")
-                traceback.print_exc()
+                logger.debug(f"DOI-History Error: {e}", exc_info=True)
                 data["doi"] = []
 
         # Tron-Transaktionen
-        if self.wm.tron:
+        if wm.tron:
             try:
-                trx_hist = self.wm.tron.get_history(limit=20)
-                print(f"[DEBUG] TRX-History Typ: {type(trx_hist).__name__}")
+                trx_hist = wm.tron.get_history(limit=20)
+                logger.debug(f"TRX-History Typ: {type(trx_hist).__name__}")
                 if isinstance(trx_hist, list):
                     data["trx"] = trx_hist
                     if trx_hist:
-                        print(f"[DEBUG] TRX TX[0]: {trx_hist[0]}")
+                        logger.debug(f"TRX TX[0]: {trx_hist[0]}")
                 elif isinstance(trx_hist, dict) and "data" in trx_hist:
                     data["trx"] = trx_hist["data"]
                 else:
                     data["trx"] = []
             except Exception as e:
-                print(f"[DEBUG] TRX-History Error: {e}")
+                logger.debug(f"TRX-History Error: {e}")
                 data["trx"] = []
 
             try:
-                usdt_hist = self.wm.tron.get_usdt_history(limit=20)
-                print(f"[DEBUG] USDT-History Typ: {type(usdt_hist).__name__}")
+                usdt_hist = wm.tron.get_usdt_history(limit=20)
+                logger.debug(f"USDT-History Typ: {type(usdt_hist).__name__}")
                 if isinstance(usdt_hist, list):
                     data["usdt"] = usdt_hist
                 elif isinstance(usdt_hist, dict) and "data" in usdt_hist:
@@ -1672,21 +1782,31 @@ class WalletApp(ctk.CTk):
                 else:
                     data["usdt"] = []
             except Exception as e:
-                print(f"[DEBUG] USDT-History Error: {e}")
+                logger.debug(f"USDT-History Error: {e}")
                 data["usdt"] = []
 
-        self._hist_data = data
-        self.after(0, self._render_history)
+        # Ergebnis in den Slot-eigenen Speicher schreiben; UI nur aktualisieren,
+        # wenn dieser Slot noch aktiv und die Generation noch aktuell ist.
+        slot["hist_data"] = data
 
-    def _load_eth_history_rpc(self, wdoi_txs: list = None) -> list:
+        def _apply():
+            _finish()
+            if not _still_current():
+                return
+            self._hist_data = data
+            self._render_history()
+
+        self._safe_after(0, _apply)
+
+    def _load_eth_history_rpc(self, wm, wdoi_txs: list = None) -> list:
         """
         Lädt ETH-Transaktionshistory über Web3 RPC.
         Nutzt wDOI TX-Hashes + Etherscan API Fallback.
         """
-        eth = self.wm.eth
+        eth = wm.eth
         w3 = getattr(eth, "_w3", None)
         if not w3:
-            print("[DEBUG] ETH-RPC: Kein Web3-Client")
+            logger.debug("ETH-RPC: Kein Web3-Client")
             return []
 
         addr = eth.address
@@ -1699,7 +1819,7 @@ class WalletApp(ctk.CTk):
 
         # ── Schritt 1: wDOI TX-Hashes → ETH-Details laden ──
         if wdoi_txs:
-            print(f"[DEBUG] ETH-RPC: Lade Details für {len(wdoi_txs)} wDOI-TXs")
+            logger.debug(f"ETH-RPC: Lade Details für {len(wdoi_txs)} wDOI-TXs")
             for wdoi_tx in wdoi_txs:
                 tx_hash = wdoi_tx.get("hash", "")
                 if not tx_hash or tx_hash in seen_hashes:
@@ -1756,12 +1876,12 @@ class WalletApp(ctk.CTk):
                             "block": block_num,
                         })
 
-                    print(f"[DEBUG] ETH-RPC TX {tx_hash[:12]}: "
+                    logger.debug(f"ETH-RPC TX {tx_hash[:12]}: "
                           f"val={value_wei/1e18:.6f} gas={gas_cost_wei/1e18:.6f} "
                           f"{'from_us' if is_from_us else 'to_us'}")
 
                 except Exception as e:
-                    print(f"[DEBUG] ETH-RPC TX {tx_hash[:12]} error: {e}")
+                    logger.debug(f"ETH-RPC TX {tx_hash[:12]} error: {e}")
 
         # ── Schritt 2: Blockscout API (kostenlos, kein Key nötig) ──
         import urllib.request
@@ -1778,7 +1898,7 @@ class WalletApp(ctk.CTk):
 
         for api_name, url in api_sources:
             try:
-                print(f"[DEBUG] ETH-RPC: {api_name} → {url[:80]}...")
+                logger.debug(f"ETH-RPC: {api_name} → {url[:80]}...")
                 req = urllib.request.Request(url, headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                     "Accept": "application/json",
@@ -1789,11 +1909,11 @@ class WalletApp(ctk.CTk):
                 if api_name == "Blockscout":
                     # Blockscout v2 Format: {"items": [{...}, ...]}
                     items = api_data.get("items", [])
-                    print(f"[DEBUG] ETH-RPC: Blockscout lieferte {len(items)} TXs")
+                    logger.debug(f"ETH-RPC: Blockscout lieferte {len(items)} TXs")
                     if items:
                         first = items[0]
-                        print(f"[DEBUG] ETH-RPC: Blockscout TX[0] keys: {list(first.keys())[:15]}")
-                        print(f"[DEBUG] ETH-RPC: Blockscout TX[0] value={first.get('value')} "
+                        logger.debug(f"ETH-RPC: Blockscout TX[0] keys: {list(first.keys())[:15]}")
+                        logger.debug(f"ETH-RPC: Blockscout TX[0] value={first.get('value')} "
                               f"fee={first.get('fee')} from={first.get('from')} to={first.get('to')}")
                     for tx_item in items:
                         tx_hash = tx_item.get("hash", "")
@@ -1831,7 +1951,7 @@ class WalletApp(ctk.CTk):
 
                         is_from_us = from_hash.lower() == addr_lower
 
-                        print(f"[DEBUG] ETH-RPC: Blockscout TX {tx_hash[:12]}: "
+                        logger.debug(f"ETH-RPC: Blockscout TX {tx_hash[:12]}: "
                               f"val={value_wei} fee={fee_wei} "
                               f"{'from_us' if is_from_us else 'to_us'}")
 
@@ -1858,7 +1978,7 @@ class WalletApp(ctk.CTk):
                 elif api_name == "Etherscan":
                     status = api_data.get("status")
                     result_list = api_data.get("result", [])
-                    print(f"[DEBUG] ETH-RPC: Etherscan status={status} "
+                    logger.debug(f"ETH-RPC: Etherscan status={status} "
                           f"count={len(result_list) if isinstance(result_list, list) else 'N/A'}")
 
                     if status == "1" and isinstance(result_list, list):
@@ -1896,7 +2016,7 @@ class WalletApp(ctk.CTk):
                         break  # Etherscan hat funktioniert
 
             except Exception as e:
-                print(f"[DEBUG] ETH-RPC: {api_name} Fehler: {e}")
+                logger.debug(f"ETH-RPC: {api_name} Fehler: {e}")
 
         # ── Deduplizieren und sortieren ──
         unique = {}
@@ -1907,32 +2027,32 @@ class WalletApp(ctk.CTk):
         result = sorted(unique.values(),
                         key=lambda x: x.get("timestamp", 0), reverse=True)
 
-        print(f"[DEBUG] ETH-RPC: {len(result)} unique ETH-TXs")
+        logger.debug(f"ETH-RPC: {len(result)} unique ETH-TXs")
         return result
 
-    def _enrich_doi_history(self, raw_history: list, max_txs: int = 200) -> list:
+    def _enrich_doi_history(self, wm, raw_history: list, max_txs: int = 200) -> list:
         """
         Reichert DOI-Transaktionen mit Beträgen an via ElectrumX get_transaction.
 
         Für jede TX wird die volle Transaktion geladen und der Netto-Betrag
         für unsere Wallet-Adressen berechnet (Outputs - Inputs).
         """
-        if not self.wm or not self.wm.doi:
-            print("[DEBUG] DOI-Enrich: wm.doi nicht verfügbar")
+        if not wm or not wm.doi:
+            logger.debug("DOI-Enrich: wm.doi nicht verfügbar")
             return raw_history
 
         # ── TX-Fetch-Funktion ermitteln ──
-        tx_fetch_fn = self._find_doi_tx_fetch()
+        tx_fetch_fn = self._find_doi_tx_fetch(wm)
         if not tx_fetch_fn:
             return raw_history
 
         # ── Alle Wallet-Adressen sammeln ──
-        our_addrs = self._collect_doi_addresses(raw_history)
+        our_addrs = self._collect_doi_addresses(wm, raw_history)
         if not our_addrs:
-            print("[DEBUG] DOI-Enrich: Keine Wallet-Adressen gefunden")
+            logger.debug("DOI-Enrich: Keine Wallet-Adressen gefunden")
             return raw_history
 
-        print(f"[DEBUG] DOI-Enrich: {len(our_addrs)} Adressen, {len(raw_history)} TXs")
+        logger.debug(f"DOI-Enrich: {len(our_addrs)} Adressen, {len(raw_history)} TXs")
 
         # ── Test-Aufruf ──
         test_hash = next(
@@ -1944,21 +2064,35 @@ class WalletApp(ctk.CTk):
             try:
                 test_result = tx_fetch_fn(test_hash)
                 if isinstance(test_result, str):
-                    print("[DEBUG] DOI-Enrich: Raw-Hex → verbose nicht unterstützt")
+                    logger.debug("DOI-Enrich: Raw-Hex → verbose nicht unterstützt")
                     return raw_history
                 elif isinstance(test_result, dict):
                     keys = list(test_result.keys())[:8]
-                    print(f"[DEBUG] DOI-Enrich: Test OK, Keys: {keys}")
+                    logger.debug(f"DOI-Enrich: Test OK, Keys: {keys}")
                 else:
-                    print(f"[DEBUG] DOI-Enrich: Unerwarteter Typ: {type(test_result)}")
+                    logger.debug(f"DOI-Enrich: Unerwarteter Typ: {type(test_result)}")
                     return raw_history
             except Exception as e:
-                print(f"[DEBUG] DOI-Enrich: Test fehlgeschlagen: {e}")
+                logger.debug(f"DOI-Enrich: Test fehlgeschlagen: {e}")
                 return raw_history
 
         # ── Transaktionen laden und anreichern ──
         sorted_hist = sorted(raw_history, key=lambda x: x.get("height", 0), reverse=True)
-        tx_cache = {}
+        # Persistenter In-Memory-Cache (txid → verbose dict): bestaetigte TXs
+        # sind unveraenderlich, der 60s-Auto-Refresh muss sie nicht neu laden.
+        tx_cache = self._tx_cache
+
+        def _fetch_cached(txid):
+            cached = tx_cache.get(txid)
+            if cached is not None:
+                return cached
+            fetched = tx_fetch_fn(txid)
+            # Nur bestaetigte TXs cachen (unbestaetigte aendern sich noch,
+            # z.B. bekommen sie spaeter blocktime/Confirmations).
+            if isinstance(fetched, dict) and fetched.get("blocktime"):
+                tx_cache[txid] = fetched
+            return fetched
+
         enriched = []
 
         for entry in sorted_hist[:max_txs]:
@@ -1968,11 +2102,7 @@ class WalletApp(ctk.CTk):
                 continue
 
             try:
-                if tx_hash not in tx_cache:
-                    tx_data = tx_fetch_fn(tx_hash)
-                    tx_cache[tx_hash] = tx_data
-                else:
-                    tx_data = tx_cache[tx_hash]
+                tx_data = _fetch_cached(tx_hash)
 
                 if not tx_data or not isinstance(tx_data, dict):
                     continue
@@ -1997,11 +2127,7 @@ class WalletApp(ctk.CTk):
                         continue  # Coinbase TX
 
                     try:
-                        if prev_txid not in tx_cache:
-                            prev_tx = tx_fetch_fn(prev_txid)
-                            tx_cache[prev_txid] = prev_tx
-                        else:
-                            prev_tx = tx_cache[prev_txid]
+                        prev_tx = _fetch_cached(prev_txid)
 
                         if prev_tx and isinstance(prev_tx, dict) and "vout" in prev_tx:
                             prev_vout = prev_tx["vout"]
@@ -2014,11 +2140,11 @@ class WalletApp(ctk.CTk):
                                 if any(a in our_addrs for a in pv_addrs):
                                     our_input += float(pv.get("value", 0))
                     except Exception as e:
-                        print(f"[DEBUG] DOI-Enrich vin error: {e}")
+                        logger.debug(f"DOI-Enrich vin error: {e}")
 
                 # ── Netto-Betrag ──
                 net = our_output - our_input
-                print(f"[DEBUG] DOI TX {tx_hash[:12]}: out={our_output:.8f} in={our_input:.8f} net={net:.8f}")
+                logger.debug(f"DOI TX {tx_hash[:12]}: out={our_output:.8f} in={our_input:.8f} net={net:.8f}")
 
                 if abs(net) < 0.00000001:
                     continue  # Kein relevanter Transfer
@@ -2038,7 +2164,7 @@ class WalletApp(ctk.CTk):
                 })
 
             except Exception as e:
-                print(f"[DEBUG] DOI-Enrich error {tx_hash[:16]}: {e}")
+                logger.debug(f"DOI-Enrich error {tx_hash[:16]}: {e}")
                 enriched.append({
                     "hash": tx_hash,
                     "direction": "unknown",
@@ -2050,16 +2176,16 @@ class WalletApp(ctk.CTk):
                     "block": height,
                 })
 
-        print(f"[DEBUG] DOI-Enrich: {len(enriched)} von {len(raw_history)} angereichert")
+        logger.debug(f"DOI-Enrich: {len(enriched)} von {len(raw_history)} angereichert")
         return enriched if enriched else raw_history
 
-    def _find_doi_tx_fetch(self):
+    def _find_doi_tx_fetch(self, wm):
         """Findet die beste Methode um DOI-Transaktionen per Hash zu laden."""
-        doi = self.wm.doi
+        doi = wm.doi
 
         # ── Versuch 1: Direkt auf dem DOI-Wallet ──
         if hasattr(doi, "get_transaction"):
-            print("[DEBUG] DOI-Enrich: Verwende doi.get_transaction()")
+            logger.debug("DOI-Enrich: Verwende doi.get_transaction()")
             return lambda h: doi.get_transaction(h)
 
         # ── Versuch 2: ElectrumX-Client suchen ──
@@ -2072,10 +2198,10 @@ class WalletApp(ctk.CTk):
                 continue
             # Dicts überspringen (z.B. network={host, port} Config)
             if isinstance(obj, dict):
-                print(f"[DEBUG] DOI-Enrich: '{attr}' ist ein Dict (Config), überspringe")
+                logger.debug(f"DOI-Enrich: '{attr}' ist ein Dict (Config), überspringe")
                 continue
             electrumx = obj
-            print(f"[DEBUG] DOI-Enrich: ElectrumX-Client via doi.{attr}")
+            logger.debug(f"DOI-Enrich: ElectrumX-Client via doi.{attr}")
             break
 
         if electrumx:
@@ -2085,7 +2211,7 @@ class WalletApp(ctk.CTk):
                 fn = getattr(electrumx, method_name, None)
                 if not fn or not callable(fn):
                     continue
-                print(f"[DEBUG] DOI-Enrich: Verwende electrumx.{method_name}()")
+                logger.debug(f"DOI-Enrich: Verwende electrumx.{method_name}()")
                 if method_name == "get_transaction":
                     return lambda h, _fn=fn: _fn(h, verbose=True)
                 else:
@@ -2094,7 +2220,7 @@ class WalletApp(ctk.CTk):
             # Kein bekannter Methodenname → alle callable Attribute zeigen
             callables = [m for m in dir(electrumx) if not m.startswith('_')
                          and callable(getattr(electrumx, m, None))]
-            print(f"[DEBUG] DOI-Enrich: Callable methods auf Client: {callables}")
+            logger.debug(f"DOI-Enrich: Callable methods auf Client: {callables}")
 
         # ── Versuch 3: Direkte JSON-RPC über TCP/SSL ──
         host, port = None, None
@@ -2106,7 +2232,7 @@ class WalletApp(ctk.CTk):
             port = net_dict.get("port", net_dict.get("ssl_port",
                    net_dict.get("tcp_port", None)))
             if host:
-                print(f"[DEBUG] DOI-Enrich: Host/Port aus network-Dict: {host}:{port}")
+                logger.debug(f"DOI-Enrich: Host/Port aus network-Dict: {host}:{port}")
 
         # Fallback: Attribute auf doi oder electrumx
         if not host:
@@ -2119,19 +2245,70 @@ class WalletApp(ctk.CTk):
                     break
 
         if host and port:
-            print(f"[DEBUG] DOI-Enrich: Verwende direkten JSON-RPC → {host}:{port}")
+            logger.debug(f"DOI-Enrich: Verwende direkten JSON-RPC → {host}:{port}")
+
+            # Gepinnte Fingerprints analog src/wallet/electrumx_client.py
+            # (per-Host-Dict bevorzugt, Legacy-Liste gilt fuer alle Hosts).
+            _net_cfg = net_dict if isinstance(net_dict, dict) else {}
+
+            def _pinned_for_host(h):
+                pinned = _net_cfg.get("ssl_pinned_fingerprints") or {}
+                fps = (pinned.get(h) or []) if isinstance(pinned, dict) else pinned
+                return {str(fp).lower().replace(":", "").replace(" ", "")
+                        for fp in fps}
+
+            def _wrap_tls(_host, _port):
+                """
+                TLS-Verbindung mit echter Validierung:
+                  1. Strikte CA-/Hostname-Pruefung (certifi/System-CAs).
+                  2. Nur bei Zertifikatsfehler: Fingerprint-Pinning wie im
+                     ElectrumXClient. NIEMALS blind jedes Zertifikat akzeptieren.
+                """
+                import socket
+                import ssl as _ssl
+                import hashlib as _hashlib
+
+                raw = socket.create_connection((_host, _port), timeout=10)
+                try:
+                    try:
+                        import certifi
+                        ctx = _ssl.create_default_context(cafile=certifi.where())
+                    except ImportError:
+                        ctx = _ssl.create_default_context()
+                    return ctx.wrap_socket(raw, server_hostname=_host)
+                except _ssl.SSLCertVerificationError:
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                    pinned = _pinned_for_host(_host)
+                    if not pinned:
+                        raise  # Kein Pinning konfiguriert → Fehler durchreichen
+
+                # Fallback: Pinning (self-signed Zertifikate). Identitaet wird
+                # ueber den SHA-256 Fingerprint des DER-Zertifikats geprueft.
+                raw = socket.create_connection((_host, _port), timeout=10)
+                ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                tls = ctx.wrap_socket(raw, server_hostname=_host)
+                der_cert = tls.getpeercert(binary_form=True)
+                actual = _hashlib.sha256(der_cert or b"").hexdigest()
+                if actual not in pinned:
+                    tls.close()
+                    raise _ssl.SSLError(
+                        f"Certificate-Pinning fehlgeschlagen für {_host}: "
+                        f"Fingerprint nicht in ssl_pinned_fingerprints.")
+                return tls
 
             def _fetch_direct(tx_hash, _host=host, _port=int(port)):
                 import socket
                 import json as _json
-                sock = socket.create_connection((_host, _port), timeout=10)
+                if _port in (50002, 51002):
+                    sock = _wrap_tls(_host, _port)
+                else:
+                    sock = socket.create_connection((_host, _port), timeout=10)
                 try:
-                    if _port in (50002, 51002):
-                        import ssl
-                        ctx = ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        sock = ctx.wrap_socket(sock)
                     req = _json.dumps({
                         "jsonrpc": "2.0",
                         "method": "blockchain.transaction.get",
@@ -2153,21 +2330,21 @@ class WalletApp(ctk.CTk):
             return _fetch_direct
 
         # Nichts gefunden – ausführliches Debug
-        print("[DEBUG] DOI-Enrich: Keine TX-Fetch-Methode gefunden!")
+        logger.debug("DOI-Enrich: Keine TX-Fetch-Methode gefunden!")
         doi_attrs = [a for a in dir(doi) if not a.startswith('__')]
-        print(f"[DEBUG] DOI attrs: {doi_attrs}")
+        logger.debug(f"DOI attrs: {doi_attrs}")
         if electrumx:
             ex_attrs = [a for a in dir(electrumx) if not a.startswith('__')]
-            print(f"[DEBUG] ElectrumX attrs: {ex_attrs}")
+            logger.debug(f"ElectrumX attrs: {ex_attrs}")
         if isinstance(net_dict, dict):
-            print(f"[DEBUG] network dict keys: {list(net_dict.keys())}")
-            print(f"[DEBUG] network dict: {net_dict}")
+            logger.debug(f"network dict keys: {list(net_dict.keys())}")
+            logger.debug(f"network dict: {net_dict}")
         return None
 
-    def _collect_doi_addresses(self, raw_history):
+    def _collect_doi_addresses(self, wm, raw_history):
         """Sammelt alle DOI-Wallet-Adressen."""
         our_addrs = set()
-        doi = self.wm.doi
+        doi = wm.doi
 
         try:
             all_addr = doi.get_all_addresses()
@@ -2232,9 +2409,9 @@ class WalletApp(ctk.CTk):
                 if normalized:
                     all_txs.append(normalized)
                 else:
-                    print(f"[DEBUG] normalize returned None for {chain}: {str(tx)[:80]}")
+                    logger.debug(f"normalize returned None for {chain}: {str(tx)[:80]}")
 
-        print(f"[DEBUG] _render_history: filter={chain_filter}, chains={list(self._hist_data.keys())}, total_txs={len(all_txs)}")
+        logger.debug(f"_render_history: filter={chain_filter}, chains={list(self._hist_data.keys())}, total_txs={len(all_txs)}")
 
         # Unbestaetigte TXs mit aktuellem Timestamp versehen (damit sie oben stehen)
         import time as _time
@@ -2404,7 +2581,7 @@ class WalletApp(ctk.CTk):
 
             return None
         except Exception as e:
-            print(f"[DEBUG] normalize_tx error ({chain}): {e}")
+            logger.debug(f"normalize_tx error ({chain}): {e}")
             return None
 
     @staticmethod
@@ -2436,7 +2613,7 @@ class WalletApp(ctk.CTk):
     def _make_tx_card(self, parent, tx):
         """Erstellt eine Transaktions-Karte."""
         symbol = tx.get("symbol", "?")
-        print(f"[DEBUG] _make_tx_card: {symbol} {tx.get('direction','?')} {tx.get('value',0)}")
+        logger.debug(f"_make_tx_card: {symbol} {tx.get('direction','?')} {tx.get('value',0)}")
                 # Notiz vorhanden?
         tx_hash_check = tx.get("hash", "")
         has_note = tx_hash_check in self._tx_notes
@@ -3445,15 +3622,18 @@ class WalletApp(ctk.CTk):
                     pass
                 break  # Ein Mal reicht
 
-        # Aktiven Slot aktualisieren
-        active = self._wallet_slots[self._active_slot]
-        self._balances = active["balances"].copy()
-        self._doi_connected = active["doi_connected"]
-        self._price_doi = active["price_doi"]
+        # Aktiven Slot aktualisieren – im Main-Thread, damit ein Tab-Wechsel
+        # waehrend des Ladens keinen veralteten Slot anzeigt (v0.9.6)
+        def _apply():
+            active = self._wallet_slots[self._active_slot]
+            self._balances = active["balances"].copy()
+            self._doi_connected = active["doi_connected"]
+            self._price_doi = active["price_doi"]
+            self._refresh_dashboard()
+            self.conn_label.configure(
+                text=self._get_conn_text(), text_color=COLOR_TEXT_DIM)
 
-        self.after(0, self._refresh_dashboard)
-        self.after(0, lambda: self.conn_label.configure(
-            text=self._get_conn_text(), text_color=COLOR_TEXT_DIM))
+        self._safe_after(0, _apply)
 
     def _normal_startup(self):
         """Normaler Start mit StartupDialog fuer Slot 0."""
@@ -3518,37 +3698,54 @@ class WalletApp(ctk.CTk):
         threading.Thread(target=self._connect_and_refresh, daemon=True).start()
 
     def _connect_and_refresh(self):
-        """Hintergrund: DOI verbinden + Salden laden."""
-        if not self.wm:
+        """
+        Hintergrund: DOI verbinden + Salden laden.
+
+        Slot-gebunden: Der Slot-Kontext (Index, wm, xt) wird beim Thread-Start
+        eingefroren und alle Ergebnisse landen im Slot-eigenen Speicher.
+        UI-Updates erfolgen nur, wenn der Slot beim Apply noch aktiv ist –
+        sonst wuerde ein Tab-Wechsel waehrend des Ladens die Daten von
+        Wallet A in Slot B anzeigen/speichern.
+        """
+        slot_idx = self._active_slot
+        slot = self._wallet_slots[slot_idx]
+        wm = slot["wm"]
+        xt = slot.get("xt")
+        if not wm:
             return
+
+        def _update_conn():
+            if slot_idx != self._active_slot:
+                return
+            self._doi_connected = slot["doi_connected"]
+            self.conn_label.configure(
+                text=self._get_conn_text(), text_color=COLOR_TEXT_DIM)
 
         # DOI ElectrumX
         try:
-            self.wm.connect_doi()
-            self._doi_connected = True
+            wm.connect_doi()
+            slot["doi_connected"] = True
         except Exception:
-            self._doi_connected = False
+            slot["doi_connected"] = False
 
-        self.after(0, lambda: self.conn_label.configure(
-            text=self._get_conn_text(), text_color=COLOR_TEXT_DIM))
+        self._safe_after(0, _update_conn)
 
         # ETH RPC
         try:
-            if self.wm.eth:
-                self.wm.connect_eth()
+            if wm.eth:
+                wm.connect_eth()
         except Exception:
             pass
 
         # Verbindungsstatus nach ETH-Connect aktualisieren
-        self.after(0, lambda: self.conn_label.configure(
-            text=self._get_conn_text(), text_color=COLOR_TEXT_DIM))
+        self._safe_after(0, _update_conn)
 
         # Block-Hoehen aktualisieren (DOI)
         # v0.9.6: get_server_info()/_client.call existieren nicht in unserem Client.
         # Nutze stattdessen das in v0.9.5 ergaenzte get_tip().
         try:
-            if self.wm and self.wm.doi and self.wm.doi.electrum:
-                ec = self.wm.doi.electrum
+            if wm.doi and wm.doi.electrum:
+                ec = wm.doi.electrum
                 h = 0
                 # Primaer: get_tip (blockchain.headers.subscribe)
                 try:
@@ -3560,7 +3757,7 @@ class WalletApp(ctk.CTk):
                 # Fallback: max height aus eigener TX-History
                 if h == 0:
                     try:
-                        hist = self.wm.doi.get_history()
+                        hist = wm.doi.get_history()
                         if isinstance(hist, list):
                             h = max((tx.get("height", 0) for tx in hist
                                      if tx.get("height", 0) > 0), default=0)
@@ -3571,25 +3768,32 @@ class WalletApp(ctk.CTk):
         except Exception:
             pass
         try:
-            if self.wm and self.wm.eth and hasattr(self.wm.eth, '_w3') and self.wm.eth._w3:
-                self._block_heights["eth"] = self.wm.eth._w3.eth.block_number
+            if wm.eth and hasattr(wm.eth, '_w3') and wm.eth._w3:
+                self._block_heights["eth"] = wm.eth._w3.eth.block_number
         except Exception:
             pass
 
-        # Salden laden
-        self._load_balances()
-        self.after(0, self._refresh_dashboard)
+        # Salden in den Slot-eigenen Speicher laden
+        self._load_balances(wm, slot["balances"])
 
         # DOI-Preis
-        if self.xt:
+        if xt:
             try:
-                t = self.xt.get_ticker()
-                self._price_doi = t["price"]
+                t = xt.get_ticker()
+                slot["price_doi"] = t["price"]
             except Exception:
                 pass
 
-        # State im aktuellen Slot speichern
-        self._save_slot_state(self._active_slot)
+        # Ergebnisse nur uebernehmen, wenn der Slot noch aktiv ist
+        def _apply():
+            if slot_idx != self._active_slot:
+                return
+            self._balances = slot["balances"].copy()
+            self._doi_connected = slot["doi_connected"]
+            self._price_doi = slot["price_doi"]
+            self._refresh_dashboard()
+
+        self._safe_after(0, _apply)
 
     def _get_conn_text(self):
         doi = "✅" if self._doi_connected else "❌"
@@ -3601,54 +3805,78 @@ class WalletApp(ctk.CTk):
     # Salden
     # ──────────────────────────────────────
 
-    def _load_balances(self):
-        """Lädt Salden (Thread-safe)."""
-        if not self.wm:
+    def _load_balances(self, wm, balances):
+        """
+        Lädt Salden des uebergebenen Wallets in das uebergebene Dict.
+
+        Slot-gebunden (v0.9.6): wm + Ziel-Dict werden vom Aufrufer beim
+        Thread-Start eingefroren, damit ein Tab-Wechsel waehrend des Ladens
+        keine Salden in den falschen Slot schreibt.
+        """
+        if not wm:
             return
 
         try:
-            doi_bal = self.wm.doi.get_balance(force_refresh=True)
-            self._balances["doi"] = doi_bal.get("confirmed_doi", 0)
+            doi_bal = wm.doi.get_balance(force_refresh=True)
+            balances["doi"] = doi_bal.get("confirmed_doi", 0)
         except Exception:
             pass
 
         try:
-            self._balances["trx"] = self.wm.tron.get_trx_balance()
+            balances["trx"] = wm.tron.get_trx_balance()
         except Exception:
             pass
 
         try:
-            self._balances["usdt"] = self.wm.tron.get_usdt_balance()
+            balances["usdt"] = wm.tron.get_usdt_balance()
         except Exception:
             pass
 
-        if self.wm.eth:
+        if wm.eth:
             try:
-                self._balances["eth"] = self.wm.eth.get_eth_balance()
+                balances["eth"] = wm.eth.get_eth_balance()
             except Exception:
                 pass
 
             try:
-                self._balances["wdoi"] = self.wm.eth.get_wdoi_balance()
+                balances["wdoi"] = wm.eth.get_wdoi_balance()
             except Exception:
                 pass
 
     def _refresh_balances_async(self):
         """Salden im Hintergrund aktualisieren."""
         self.conn_label.configure(text="⏳ Lade Salden...", text_color=COLOR_WARNING)
-        threading.Thread(target=self._do_refresh, daemon=True).start()
+        slot_idx = self._active_slot
+        threading.Thread(target=self._do_refresh, args=(slot_idx,), daemon=True).start()
 
-    def _do_refresh(self):
-        self._load_balances()
-        if self.xt:
+    def _do_refresh(self, slot_idx=None):
+        """Hintergrund-Refresh der Salden (slot-gebunden, siehe _load_balances)."""
+        if slot_idx is None:
+            slot_idx = self._active_slot
+        slot = self._wallet_slots[slot_idx]
+        wm = slot["wm"]
+        xt = slot.get("xt")
+        if not wm:
+            return
+
+        self._load_balances(wm, slot["balances"])
+        if xt:
             try:
-                t = self.xt.get_ticker()
-                self._price_doi = t["price"]
+                t = xt.get_ticker()
+                slot["price_doi"] = t["price"]
             except Exception:
                 pass
-        self.after(0, self._refresh_dashboard)
-        self.after(0, lambda: self.conn_label.configure(
-            text=self._get_conn_text(), text_color=COLOR_TEXT_DIM))
+
+        def _apply():
+            if slot_idx != self._active_slot:
+                return
+            self._balances = slot["balances"].copy()
+            self._price_doi = slot["price_doi"]
+            self._refresh_dashboard()
+            self.conn_label.configure(
+                text=self._get_conn_text(), text_color=COLOR_TEXT_DIM)
+
+        self._safe_after(0, _apply)
 
     def _refresh_dashboard(self):
         """Dashboard-Anzeige aktualisieren."""
@@ -3737,10 +3965,19 @@ class WalletApp(ctk.CTk):
             self._send_status.configure(text="Abgebrochen.", text_color=COLOR_TEXT_DIM)
             return
 
-        # Tageslimit pruefen
+        # Passwort WIRKLICH verifizieren (scrypt, ~1s) – vorher autorisierte
+        # jede beliebige nicht-leere Eingabe die Transaktion!
+        self._send_status.configure(text="⏳ Prüfe Passwort...", text_color=COLOR_WARNING)
+        self.update_idletasks()
+        if not self.wm or not self.wm.verify_password(pw):
+            self._send_status.configure(text="❌ Falsches Passwort!", text_color=COLOR_ERROR)
+            return
+
+        # Tageslimit pruefen (nur Pruefung – verbucht wird erst nach Erfolg)
         if not self._check_daily_limit(amount, chain):
             self._send_status.configure(text="Abgebrochen (Tageslimit).", text_color=COLOR_TEXT_DIM)
             return
+        eur_value = self._estimate_eur_value(amount, chain)
 
         # Undo-Timer
         if not self._show_undo_countdown(chain, addr, amount):
@@ -3751,26 +3988,50 @@ class WalletApp(ctk.CTk):
         self._send_btn.configure(state="disabled", text="⏳ Sende...")
         self._send_status.configure(text="Sende Transaktion...", text_color=COLOR_WARNING)
 
+        # Slot-Kontext einfrieren – ein Tab-Wechsel waehrend des Sendens darf
+        # weder das falsche Wallet benutzen noch fremde Slots ueberschreiben.
+        slot_idx = self._active_slot
+        slot = self._wallet_slots[slot_idx]
+        wm = slot["wm"] or self.wm
+        self._send_in_progress = True
+
         def _send_thread():
             try:
-                result = self.wm.send(chain, addr, amount)
+                result = wm.send(chain, addr, amount)
                 tx_id = result.get("txid", result.get("tx_id", "N/A"))
-                self.after(0, lambda: self._send_status.configure(
+                self._safe_after(0, lambda: self._send_status.configure(
                     text=f"✅ Gesendet! TX: {shorten_addr(tx_id, 12)}",
                     text_color=COLOR_SUCCESS,
                 ))
-                # Salden aktualisieren
-                self._load_balances()
-                self.after(500, self._refresh_dashboard)
+                # Tageslimit erst NACH erfolgreichem Senden verbuchen –
+                # Abbrueche/Fehler duerfen das Limit nicht verbrauchen.
+                self._safe_after(0, lambda: self._add_daily_send(eur_value))
+                # Salden aktualisieren (in den Slot-eigenen Speicher)
+                self._load_balances(wm, slot["balances"])
+
+                def _apply_balances():
+                    if slot_idx != self._active_slot:
+                        return
+                    self._balances = slot["balances"].copy()
+                    self._refresh_dashboard()
+
+                self._safe_after(500, _apply_balances)
                 # v0.9.6: History async neu laden – damit die soeben gesendete
                 # Tx in der Transaktionsliste als unbestätigt erscheint
-                self.after(800, self._refresh_history_async)
+                def _refresh_hist():
+                    if slot_idx == self._active_slot:
+                        self._refresh_history_async(force=True)
+                self._safe_after(800, _refresh_hist)
             except Exception as e:
-                self.after(0, lambda: self._send_status.configure(
-                    text=f"❌ {e}", text_color=COLOR_ERROR,
+                # 'e' wird nach dem except-Block geloescht – fuer das deferred
+                # Lambda muss die Meldung vorher gebunden werden (NameError-Fix).
+                msg = str(e)
+                self._safe_after(0, lambda m=msg: self._send_status.configure(
+                    text=f"❌ {m}", text_color=COLOR_ERROR,
                 ))
             finally:
-                self.after(0, lambda: self._send_btn.configure(
+                self._send_in_progress = False
+                self._safe_after(0, lambda: self._send_btn.configure(
                     state="normal", text="📤  Senden"))
 
         threading.Thread(target=_send_thread, daemon=True).start()
@@ -3788,9 +4049,9 @@ class WalletApp(ctk.CTk):
 
     def _load_exchange_data(self):
         try:
-            print(f"[DEBUG] Exchange: xt={self.xt}, has_cred={getattr(self.xt, 'has_credentials', '?')}")
+            logger.debug(f"Exchange: xt={self.xt}, has_cred={getattr(self.xt, 'has_credentials', '?')}")
             t = self.xt.get_ticker()
-            print(f"[DEBUG] Exchange: ticker={t}")
+            logger.debug(f"Exchange: ticker={t}")
             t24 = self.xt.get_ticker_24h()
             ob = self.xt.get_orderbook(limit=8)
 
@@ -3842,7 +4103,7 @@ class WalletApp(ctk.CTk):
             if self.xt.has_credentials:
                 try:
                     balances = self.xt.get_balances()
-                    print(f"[DEBUG] Exchange: balances={balances[:3] if balances else 'EMPTY'}")
+                    logger.debug(f"Exchange: balances={balances[:3] if balances else 'EMPTY'}")
                     bal_lines = [f"{'Währung':<10s}  {'Verfügbar':>14s}  {'Gesperrt':>14s}"]
                     bal_lines.append("─" * 42)
                     for b in balances:
@@ -3860,10 +4121,13 @@ class WalletApp(ctk.CTk):
                         self._xt_balance_text.configure(state="disabled")
                     self.after(0, _update_bal)
                 except Exception as e:
-                    def _update_bal_err():
+                    # 'e' wird nach dem except-Block geloescht – Meldung fuer
+                    # den deferred Callback vorher binden (NameError-Fix).
+                    msg = str(e)
+                    def _update_bal_err(m=msg):
                         self._xt_balance_text.configure(state="normal")
                         self._xt_balance_text.delete("1.0", "end")
-                        self._xt_balance_text.insert("1.0", f"🔓 Kein API-Key oder Fehler: {e}")
+                        self._xt_balance_text.insert("1.0", f"🔓 Kein API-Key oder Fehler: {m}")
                         self._xt_balance_text.configure(state="disabled")
                     self.after(0, _update_bal_err)
 
@@ -3893,7 +4157,8 @@ class WalletApp(ctk.CTk):
                     pass
 
             else:
-                print(f"[DEBUG] Exchange: has_credentials=False, api_key='{getattr(self.xt, '_api_key', '?')[:8]}...'")
+                # Kein API-Key konfiguriert – KEINE Key-Fragmente loggen!
+                logger.debug("Exchange: has_credentials=False")
                 def _no_cred():
                     self._xt_balance_text.configure(state="normal")
                     self._xt_balance_text.delete("1.0", "end")
@@ -3915,10 +4180,11 @@ class WalletApp(ctk.CTk):
                 self.after(0, lambda: self._dw_status_label.configure(text="Status nicht verfügbar"))
 
         except Exception as e:
-            print(f"[DEBUG] Exchange FEHLER: {e}")
-            import traceback; traceback.print_exc()
-            self.after(0, lambda: self._xt_price_label.configure(
-                text=f"Fehler: {e}"))
+            logger.debug(f"Exchange FEHLER: {e}", exc_info=True)
+            # NameError-Fix: 'e' fuer das deferred Lambda binden
+            msg = str(e)
+            self.after(0, lambda m=msg: self._xt_price_label.configure(
+                text=f"Fehler: {m}"))
 
     def _calc_vwap(self):
         """VWAP-Berechnung."""
@@ -3944,8 +4210,10 @@ class WalletApp(ctk.CTk):
                 self.after(0, lambda: self._vwap_result.configure(
                     text=text, text_color=COLOR_SUCCESS))
             except Exception as e:
-                self.after(0, lambda: self._vwap_result.configure(
-                    text=f"❌ {e}", text_color=COLOR_ERROR))
+                # NameError-Fix: 'e' fuer das deferred Lambda binden
+                msg = str(e)
+                self.after(0, lambda m=msg: self._vwap_result.configure(
+                    text=f"❌ {m}", text_color=COLOR_ERROR))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -3964,10 +4232,19 @@ class WalletApp(ctk.CTk):
             self._order_status.configure(text="❌ Ungültige Menge!", text_color=COLOR_ERROR)
             return
 
+        # Preis ebenfalls im Main-Thread lesen und validieren – Tkinter-Widgets
+        # duerfen nicht aus dem Worker-Thread gelesen werden.
+        price = None
+        if order_type == "limit":
+            try:
+                price = float(self._order_price.get())
+            except ValueError:
+                self._order_status.configure(text="❌ Ungültiger Preis!", text_color=COLOR_ERROR)
+                return
+
         def _do():
             try:
                 if order_type == "limit":
-                    price = float(self._order_price.get())
                     result = self.xt.place_limit_order(side, price, quantity)
                 else:
                     result = self.xt.place_market_order(side, quantity)
@@ -4118,7 +4395,12 @@ class WalletApp(ctk.CTk):
         ).pack(pady=(8, 14), padx=15, fill="x")
 
     def _show_debug_info(self):
-        """Zeigt Diagnose-Informationen zum aktuellen Wallet."""
+        """
+        Zeigt Diagnose-Informationen zum aktuellen Wallet.
+
+        Die Datensammlung macht dutzende Netzwerk-Calls und laeuft deshalb in
+        einem Worker-Thread; der Dialog zeigt solange "⏳ Sammle Diagnose...".
+        """
         dialog = ctk.CTkToplevel(self)
         dialog.title("Wallet-Diagnose")
         dialog.geometry("550x520")
@@ -4138,20 +4420,50 @@ class WalletApp(ctk.CTk):
             fg_color=COLOR_CARD, text_color=COLOR_TEXT,
         )
         text.pack(fill="both", expand=True, padx=15, pady=5)
+        text.insert("1.0", "⏳ Sammle Diagnose...")
+        text.configure(state="disabled")
 
-        lines = []
+        ctk.CTkButton(
+            dialog, text="Schliessen", height=35,
+            fg_color=COLOR_ACCENT, command=dialog.destroy,
+        ).pack(pady=10)
+
+        # Kontext fuer den Worker einfrieren
+        wm = self.wm
         slot = self._wallet_slots[self._active_slot]
+        active_slot = self._active_slot
+        block_heights = dict(self._block_heights)
+
+        def _gather():
+            lines = self._collect_debug_lines(wm, slot, active_slot, block_heights)
+
+            def _fill():
+                try:
+                    text.configure(state="normal")
+                    text.delete("1.0", "end")
+                    text.insert("1.0", "\n".join(lines))
+                    text.configure(state="disabled")
+                except Exception:
+                    pass  # Dialog wurde inzwischen geschlossen
+
+            self._safe_after(0, _fill)
+
+        threading.Thread(target=_gather, daemon=True).start()
+
+    def _collect_debug_lines(self, wm, slot, active_slot, block_heights):
+        """Sammelt die Diagnose-Zeilen (laeuft im Worker-Thread, netzwerk-lastig)."""
+        lines = []
         lines.append(f"=== DOI-Wallet-iX v{APP_VERSION} - Diagnose ===")
-        lines.append(f"Aktiver Tab: {slot['name']} (Slot {self._active_slot})")
+        lines.append(f"Aktiver Tab: {slot['name']} (Slot {active_slot})")
         lines.append(f"Wallet-Datei: {slot.get('dat_file', '?')}")
-        lines.append(f"Block-Hoehen: DOI={self._block_heights.get('doi', '?')} ETH={self._block_heights.get('eth', '?')}")
+        lines.append(f"Block-Hoehen: DOI={block_heights.get('doi', '?')} ETH={block_heights.get('eth', '?')}")
         lines.append("")
 
-        if self.wm:
+        if wm:
             # DOI
             lines.append("── DOI ──")
-            if self.wm.doi:
-                doi = self.wm.doi
+            if wm.doi:
+                doi = wm.doi
                 addrs = getattr(doi, '_known_addresses', {})
                 lines.append(f"Seed initialisiert: {doi.seed_manager.is_initialized if doi.seed_manager else '?'}")
                 lines.append(f"ElectrumX verbunden: {doi.electrum is not None}")
@@ -4206,11 +4518,11 @@ class WalletApp(ctk.CTk):
 
             # Tron
             lines.append("── Tron ──")
-            if self.wm.tron:
-                lines.append(f"Adresse: {self.wm.tron.primary_address}")
+            if wm.tron:
+                lines.append(f"Adresse: {wm.tron.primary_address}")
                 try:
-                    lines.append(f"TRX: {self.wm.tron.get_trx_balance()}")
-                    lines.append(f"USDT: {self.wm.tron.get_usdt_balance()}")
+                    lines.append(f"TRX: {wm.tron.get_trx_balance()}")
+                    lines.append(f"USDT: {wm.tron.get_usdt_balance()}")
                 except Exception as e:
                     lines.append(f"Balance: Fehler ({e})")
             else:
@@ -4220,12 +4532,12 @@ class WalletApp(ctk.CTk):
 
             # ETH
             lines.append("── Ethereum ──")
-            if self.wm.eth:
-                lines.append(f"Adresse: {self.wm.eth.address}")
-                lines.append(f"Verbunden: {self.wm.eth.is_connected}")
+            if wm.eth:
+                lines.append(f"Adresse: {wm.eth.address}")
+                lines.append(f"Verbunden: {wm.eth.is_connected}")
                 try:
-                    lines.append(f"ETH: {self.wm.eth.get_eth_balance()}")
-                    lines.append(f"wDOI: {self.wm.eth.get_wdoi_balance()}")
+                    lines.append(f"ETH: {wm.eth.get_eth_balance()}")
+                    lines.append(f"wDOI: {wm.eth.get_wdoi_balance()}")
                 except Exception as e:
                     lines.append(f"Balance: Fehler ({e})")
             else:
@@ -4233,13 +4545,7 @@ class WalletApp(ctk.CTk):
         else:
             lines.append("Kein WalletManager geladen!")
 
-        text.insert("1.0", "\n".join(lines))
-        text.configure(state="disabled")
-
-        ctk.CTkButton(
-            dialog, text="Schliessen", height=35,
-            fg_color=COLOR_ACCENT, command=dialog.destroy,
-        ).pack(pady=10)
+        return lines
 
     def _show_seed_phrase(self):
         """Zeigt die Seed-Phrase nach Passwort-Bestätigung an."""
@@ -4292,9 +4598,11 @@ class WalletApp(ctk.CTk):
                 error_label.configure(text="Bitte Passwort eingeben!")
                 return
 
-            # Passwort gegen gespeichertes prüfen
-            stored_pw = getattr(self.wm, '_password', None)
-            if stored_pw and password == stored_pw:
+            # Passwort kryptographisch verifizieren (scrypt, ~1s) –
+            # kein unsicherer String-Vergleich mit gespeichertem Klartext mehr.
+            error_label.configure(text="⏳ Prüfe Passwort...")
+            dialog.update_idletasks()
+            if self.wm.verify_password(password):
                 dialog.destroy()
                 SeedDialog(self, mnemonic)
             else:
@@ -4328,23 +4636,30 @@ class WalletApp(ctk.CTk):
 
         self._save_safety_settings()
 
+    def _estimate_eur_value(self, amount, chain):
+        """Rechnet einen Betrag grob in EUR um (vereinfacht: USDT ≈ EUR)."""
+        if chain == "DOI":
+            return amount * self._price_doi  # DOI → USDT ≈ EUR
+        elif chain == "USDT":
+            return amount
+        elif chain == "TRX":
+            return amount * 0.28  # Grobe Schaetzung
+        elif chain in ("ETH", "wDOI"):
+            return amount * self._price_doi if chain == "wDOI" else amount * 2500
+        return amount
+
     def _check_daily_limit(self, amount, chain):
-        """Prueft ob das Tageslimit ueberschritten wird. Gibt True zurueck wenn OK."""
+        """
+        Prueft ob das Tageslimit ueberschritten wird. Gibt True zurueck wenn OK.
+
+        Reine Pruefung – verbucht wird der Betrag erst nach erfolgreichem
+        wm.send() im Send-Thread (_add_daily_send). Abbrueche und Fehler
+        verbrauchen das Limit damit nicht mehr.
+        """
         if self._daily_limit_eur <= 0:
             return True  # Kein Limit
 
-        # Betrag in EUR umrechnen (vereinfacht: DOI-Preis * amount, USDT ~1 EUR)
-        if chain == "DOI":
-            eur_value = amount * self._price_doi  # DOI → USDT ≈ EUR
-        elif chain == "USDT":
-            eur_value = amount
-        elif chain == "TRX":
-            eur_value = amount * 0.28  # Grobe Schaetzung
-        elif chain in ("ETH", "wDOI"):
-            eur_value = amount * self._price_doi if chain == "wDOI" else amount * 2500
-        else:
-            eur_value = amount
-
+        eur_value = self._estimate_eur_value(amount, chain)
         today_total = self._get_today_sent_eur()
         new_total = today_total + eur_value
 
@@ -4397,12 +4712,9 @@ class WalletApp(ctk.CTk):
 
             self.wait_window(dialog)
 
-            if dialog._result:
-                self._add_daily_send(eur_value)
-                return True
-            return False
+            # Kein _add_daily_send hier – Verbuchung erst nach Sende-Erfolg
+            return bool(dialog._result)
         else:
-            self._add_daily_send(eur_value)
             return True
 
     def _show_undo_countdown(self, chain, addr, amount):
@@ -4501,6 +4813,32 @@ class WalletApp(ctk.CTk):
 
     def _on_close(self):
         """Wallet sauber beenden."""
+        # Laufende Sendung? Erst nachfragen – sonst geht die Status-Anzeige
+        # der Transaktion verloren.
+        if self._send_in_progress:
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Transaktion läuft",
+                "Eine Transaktion wird gerade gesendet.\n"
+                "Wirklich beenden?",
+                parent=self,
+            ):
+                return
+
+        # Ab jetzt keine Worker-Callbacks mehr annehmen (_safe_after no-op)
+        self._closing = True
+
+        # Geplanten History-Auto-Refresh stornieren
+        if self._history_autorefresh_id is not None:
+            try:
+                self.after_cancel(self._history_autorefresh_id)
+            except Exception:
+                pass
+            self._history_autorefresh_id = None
+
+        # Anstehenden Tab-Klick stornieren
+        self._cancel_pending_tab_click()
+
         try:
             self._save_tab_config()
         except Exception:
@@ -4540,6 +4878,7 @@ class WalletApp(ctk.CTk):
 # ──────────────────────────────────────────────
 
 def main():
+    setup_logging()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
 

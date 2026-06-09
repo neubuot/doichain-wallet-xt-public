@@ -14,6 +14,7 @@ Unterstützt Outputs an:
 Transaktionsformat: Version 1, Inputs nur P2PKH-signiert.
 """
 
+import math
 import struct
 import hashlib
 from typing import Optional
@@ -30,6 +31,34 @@ from .seed_manager import privkey_to_pubkey
 
 # SIGHASH Typen
 SIGHASH_ALL = 0x01
+
+# Doichain pubkey_hash Version-Bytes (Mainnet 0x34, Testnet 0x6F).
+# Der Signierer implementiert NUR den Legacy-P2PKH-Sighash (kein BIP-143,
+# keine Witness-Serialisierung) – andere Input-Typen müssen abgelehnt werden,
+# sonst entstehen ungültige Signaturen und festsitzende/verlorene Coins.
+P2PKH_VERSION_BYTES = (0x34, 0x6F)
+
+
+def _assert_p2pkh_utxo(utxo: "UTXO"):
+    """
+    Stellt sicher, dass der UTXO zu einer P2PKH-Adresse gehört.
+
+    Raises:
+        ValueError: Wenn die Adresse kein Doichain-P2PKH ist
+            (z.B. P2SH, SegWit/Bech32 oder Fremd-Chain).
+    """
+    try:
+        version, _ = address_to_pubkey_hash(utxo.address)
+    except ValueError:
+        raise ValueError(
+            f"Nur P2PKH-Inputs werden unterstützt "
+            f"(Adresse {utxo.address} ist kein Base58-P2PKH)"
+        )
+    if version not in P2PKH_VERSION_BYTES:
+        raise ValueError(
+            f"Nur P2PKH-Inputs werden unterstützt "
+            f"(Adresse {utxo.address} hat Version-Byte 0x{version:02X})"
+        )
 
 
 class UTXO:
@@ -109,8 +138,12 @@ class TxOutput:
 
     def serialize(self) -> bytes:
         """Serialisiert den Output."""
+        # Wert muss in ein unsigniertes 64-Bit-Feld passen; negative Werte
+        # würden mit "<q" stillschweigend als riesige Beträge serialisiert.
+        if self.value < 0 or self.value > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(f"Ungültiger Output-Wert: {self.value}")
         script = self.script_pubkey
-        return struct.pack("<q", self.value) + encode_varint(len(script)) + script
+        return struct.pack("<Q", self.value) + encode_varint(len(script)) + script
 
 
 def make_p2pkh_script(address: str, bech32_hrp: str = "dc") -> bytes:
@@ -134,11 +167,16 @@ class Transaction:
     def add_input(self, utxo: UTXO, private_key: bytes) -> "Transaction":
         """
         Fügt einen Input hinzu.
-        
+
         Args:
-            utxo: Der zu verbrauchende UTXO
+            utxo: Der zu verbrauchende UTXO (muss P2PKH sein)
             private_key: Der zugehörige private Schlüssel
+
+        Raises:
+            ValueError: Wenn der UTXO kein P2PKH-Input ist (der Signierer
+                unterstützt kein BIP-143/SegWit).
         """
+        _assert_p2pkh_utxo(utxo)
         self.inputs.append(TxInput(utxo, private_key))
         return self
 
@@ -291,12 +329,13 @@ class Transaction:
 
     @property
     def size(self) -> int:
-        """Geschätzte Transaktionsgröße in Bytes."""
-        # Vor Signierung: Schätzen
-        # P2PKH Input: ~148 Bytes, Output: ~34 Bytes, Overhead: ~10 Bytes
-        if any(inp.script_sig == b"" for inp in self.inputs):
-            return 10 + len(self.inputs) * 148 + len(self.outputs) * 34
-        return len(self.serialize())
+        """Transaktionsgröße in Bytes (signiert exakt, sonst minimal geschätzt)."""
+        # Basis ist immer die REALE Serialisierung (korrekte Output-Größen,
+        # VarInts etc.). Für jeden noch unsignierten Input fehlt lediglich
+        # das P2PKH-scriptSig (~107 Bytes: Sig + SIGHASH + PubKey), das wird
+        # aufaddiert statt die gesamte Transaktion pauschal zu schätzen.
+        unsigned_inputs = sum(1 for inp in self.inputs if inp.script_sig == b"")
+        return len(self.serialize()) + unsigned_inputs * 107
 
     def __repr__(self):
         return (
@@ -423,26 +462,41 @@ def _int_to_der_bytes(n: int) -> bytes:
 # Hilfsfunktionen für Transaktionserstellung
 # ============================================================
 
+def _estimate_tx_size(n_inputs: int, n_outputs: int) -> int:
+    """
+    Schätzt die Größe einer P2PKH-Transaktion in Bytes.
+
+    P2PKH-Input: ~148 Bytes, Output: ~34 Bytes, Overhead: ~10 Bytes.
+    """
+    return 10 + n_inputs * 148 + n_outputs * 34
+
+
 def select_utxos(utxos: list[UTXO], target_value: int, fee_per_byte: int = 5) -> tuple[list[UTXO], int]:
     """
     Wählt UTXOs für eine Transaktion aus (einfacher Greedy-Algorithmus).
-    
+
     Strategie: Sortiert nach Wert (größte zuerst), nimmt UTXOs
-    bis der Zielwert + geschätzte Gebühren erreicht ist.
-    
+    bis der Zielwert + geschätzte Gebühren erreicht ist. Geprüft wird
+    konsistent zuerst die 2-Output-Variante (Empfänger + Wechselgeld);
+    reicht es dafür nicht, aber für die 1-Output-Variante (kein
+    Wechselgeld, Rest geht als Gebühr), wird diese akzeptiert.
+
+    Hinweis: Die zurückgegebene Gebühr ist nur eine Vorab-Schätzung –
+    build_transaction() passt sie iterativ an die real signierte Größe an.
+
     Args:
         utxos: Verfügbare UTXOs
         target_value: Zu sendender Betrag in Satoshis
         fee_per_byte: Gebühr pro Byte in Satoshis
-    
+
     Returns:
         Tuple von (ausgewählte_utxos, geschätzte_gebühr)
-    
+
     Raises:
         ValueError: Wenn nicht genügend Guthaben vorhanden
     """
     sorted_utxos = sorted(utxos, key=lambda u: u.value, reverse=True)
-    
+
     selected = []
     total = 0
 
@@ -450,22 +504,19 @@ def select_utxos(utxos: list[UTXO], target_value: int, fee_per_byte: int = 5) ->
         selected.append(utxo)
         total += utxo.value
 
-        # Geschätzte Gebühr berechnen
-        # Inputs: ~148 Bytes, Outputs: 2 (Empfänger + Wechselgeld) × ~34 Bytes, Overhead: ~10
-        estimated_size = 10 + len(selected) * 148 + 2 * 34
-        estimated_fee = estimated_size * fee_per_byte
+        # 2 Outputs: Empfänger + Wechselgeld
+        fee_with_change = _estimate_tx_size(len(selected), 2) * fee_per_byte
+        if total >= target_value + fee_with_change:
+            return selected, fee_with_change
 
-        if total >= target_value + estimated_fee:
-            return selected, estimated_fee
+        # 1 Output: Betrag passt (fast) exakt, kein Wechselgeld-Output
+        fee_without_change = _estimate_tx_size(len(selected), 1) * fee_per_byte
+        if total >= target_value + fee_without_change:
+            return selected, fee_without_change
 
-    # Prüfe ob es mit allen UTXOs reicht
+    # Auch mit allen UTXOs reicht es nicht
     total_available = sum(u.value for u in utxos)
-    estimated_size = 10 + len(sorted_utxos) * 148 + 1 * 34  # Ohne Wechselgeld
-    estimated_fee = estimated_size * fee_per_byte
-
-    if total_available >= target_value + estimated_fee:
-        return sorted_utxos, estimated_fee
-
+    estimated_fee = _estimate_tx_size(max(len(sorted_utxos), 1), 1) * fee_per_byte
     raise ValueError(
         f"Nicht genügend Guthaben: "
         f"verfügbar {satoshi_to_doi(total_available)} DOI, "
@@ -497,35 +548,75 @@ def build_transaction(
     
     Returns:
         Signierte Transaction
+
+    Raises:
+        ValueError: Bei unzureichendem Guthaben, fehlendem privaten
+            Schlüssel oder Nicht-P2PKH-Inputs.
+
+    Hinweis:
+        Die Gebühr wird iterativ an die REAL signierte Größe angepasst:
+        bauen + signieren, Größe messen, required_fee = ceil(size × fee_per_byte),
+        Wechselgeld neu berechnen und bei Abweichung neu bauen/signieren
+        (konvergiert praktisch immer in 1-2 Durchläufen, max. 3 Nachbesserungen).
     """
-    # 1. UTXOs auswählen
-    selected_utxos, estimated_fee = select_utxos(utxos, amount_satoshi, fee_per_byte)
+    # 1. Initiale UTXO-Auswahl mit grober Gebühren-Schätzung
+    selected_list, fee = select_utxos(utxos, amount_satoshi, fee_per_byte)
+    selected = list(selected_list)
+    # Restliche UTXOs (größte zuerst), falls die reale Gebühr mehr Inputs erfordert
+    remaining = [u for u in sorted(utxos, key=lambda u: u.value, reverse=True)
+                 if u not in selected]
 
-    # 2. Wechselgeld berechnen
-    total_input = sum(u.value for u in selected_utxos)
-    change = total_input - amount_satoshi - estimated_fee
+    def _insufficient(needed: int) -> ValueError:
+        total_available = sum(u.value for u in utxos)
+        return ValueError(
+            f"Nicht genügend Guthaben: "
+            f"verfügbar {satoshi_to_doi(total_available)} DOI, "
+            f"benötigt {satoshi_to_doi(needed)} DOI (inkl. Gebühren)"
+        )
 
-    # 3. Transaktion erstellen
-    tx = Transaction()
+    tx: Optional[Transaction] = None
+    for _ in range(1 + 3):  # initialer Bau + max. 3 Nachbesserungen
+        # 2. Wechselgeld berechnen; bei Bedarf weitere UTXOs nachziehen
+        total_input = sum(u.value for u in selected)
+        change = total_input - amount_satoshi - fee
+        while change < 0:
+            if not remaining:
+                raise _insufficient(amount_satoshi + fee)
+            extra = remaining.pop(0)
+            selected.append(extra)
+            total_input += extra.value
+            # Jeder zusätzliche P2PKH-Input vergrößert die Transaktion (~148 B)
+            fee += 148 * fee_per_byte
+            change = total_input - amount_satoshi - fee
 
-    # Inputs hinzufügen
-    for utxo in selected_utxos:
-        privkey = keypairs.get(utxo.address)
-        if privkey is None:
-            raise ValueError(f"Kein privater Schlüssel für Adresse: {utxo.address}")
-        tx.add_input(utxo, privkey)
+        # 3. Transaktion erstellen
+        tx = Transaction()
 
-    # Empfänger-Output
-    tx.add_output(recipient, amount_satoshi)
+        # Inputs hinzufügen (nur P2PKH – add_input prüft das)
+        for utxo in selected:
+            privkey = keypairs.get(utxo.address)
+            if privkey is None:
+                raise ValueError(f"Kein privater Schlüssel für Adresse: {utxo.address}")
+            tx.add_input(utxo, privkey)
 
-    # Wechselgeld-Output (nur wenn über Dust-Threshold)
-    if change > dust_threshold:
-        tx.add_output(change_address, change)
-    else:
-        # Wechselgeld geht als zusätzliche Gebühr an Miner
-        estimated_fee += change
+        # Empfänger-Output
+        tx.add_output(recipient, amount_satoshi)
 
-    # 4. Signieren
-    tx.sign()
+        # Wechselgeld-Output (nur wenn über Dust-Threshold).
+        # Dust-Regel: 0 < change <= dust_threshold geht als zusätzliche
+        # Gebühr an die Miner. change ist hier garantiert >= 0 (s.o.).
+        if change > dust_threshold:
+            tx.add_output(change_address, change)
 
+        # 4. Signieren und Gebühr gegen die REALE signierte Größe prüfen
+        tx.sign()
+        required_fee = math.ceil(tx.size * fee_per_byte)
+        if tx.fee >= required_fee:
+            return tx
+
+        # Gebühr war zu niedrig geschätzt → mit korrigierter Gebühr neu bauen
+        fee = required_fee
+
+    # Nach max. Iterationen: letzter Stand weicht höchstens um wenige
+    # Satoshi (DER-Signatur-Längen-Jitter von ±1 Byte pro Input) ab.
     return tx

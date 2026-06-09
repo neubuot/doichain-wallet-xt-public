@@ -24,6 +24,8 @@ import json
 import socket
 import ssl
 import sys
+import threading
+import time
 from typing import Optional
 
 from .doichain_network import MAINNET
@@ -51,6 +53,14 @@ class ElectrumXClient:
         self._connected = False
         self._recv_buffer = b""
         self._current_server: Optional[dict] = None
+        # Thread-Sicherheit: GUI ruft aus mehreren Threads auf. RLock, damit
+        # _call() → _reconnect() → connect() im selben Thread nicht deadlockt.
+        self._lock = threading.RLock()
+        # Guard gegen Endlos-Rekursion connect → _call → _reconnect → connect.
+        self._connecting = False
+        # Letzter per Notification empfangener Blockchain-Tip
+        # (blockchain.headers.subscribe), siehe _call().
+        self._cached_tip: Optional[dict] = None
 
         # Server aus Netzwerk-Config oder Parameter
         if host and port:
@@ -62,17 +72,45 @@ class ElectrumXClient:
     # SSL-Kontext (gehärtet)
     # ========================================================
 
-    def _build_ssl_context(self) -> ssl.SSLContext:
+    @staticmethod
+    def _normalize_fingerprint(fp: str) -> str:
+        """Normalisiert einen SHA-256 Fingerprint (lowercase, ohne ':' / Leerzeichen)."""
+        return fp.lower().replace(":", "").replace(" ", "")
+
+    def _pinned_fingerprints_for_host(self, host: Optional[str]) -> set:
+        """
+        Gibt die gepinnten Fingerprints für einen bestimmten Host zurück.
+
+        Bevorzugtes Format (per-Host, verhindert dass das Zertifikat von
+        Server A für Server B akzeptiert wird):
+            "ssl_pinned_fingerprints": {
+                "white-snail-54.doi.works": ["ab12cd34..."],
+                "itchy-jellyfish-89.doi.works": ["ef56..."],
+            }
+
+        Fallback (Legacy, klar dokumentiert): Eine flache Liste von
+        Fingerprints. Diese gilt – wie bisher – für ALLE Hosts, da im
+        Altformat keine Host-Zuordnung möglich ist. Neue Einträge sollten
+        immer das Dict-Format verwenden.
+        """
+        pinned = self.network.get("ssl_pinned_fingerprints") or {}
+        if isinstance(pinned, dict):
+            # Per-Host Allowlist: nur die Fingerprints DIESES Hosts zählen.
+            return {self._normalize_fingerprint(fp) for fp in (pinned.get(host) or [])}
+        # Legacy-Fallback: flache Liste gilt für alle konfigurierten Hosts.
+        return {self._normalize_fingerprint(fp) for fp in pinned}
+
+    def _build_ssl_context(self, host: Optional[str] = None) -> ssl.SSLContext:
         """
         Baut einen SSL-Kontext entsprechend der Netzwerk-Konfiguration.
 
         Priorität:
-          1. ssl_pinned_fingerprints nicht leer  → Pinning (Hostname-Check aus,
+          1. Gepinnte Fingerprints für den Host  → Pinning (Hostname-Check aus,
              CA-Check aus, dafür nach connect() Fingerprint-Vergleich).
           2. ssl_strict = True (Default)        → CA + Hostname strikt.
           3. ssl_strict = False                 → Validierung aus (UNSICHER).
         """
-        pinned = self.network.get("ssl_pinned_fingerprints") or []
+        pinned = self._pinned_fingerprints_for_host(host)
         strict = self.network.get("ssl_strict", True)
 
         ctx = ssl.create_default_context()
@@ -100,17 +138,16 @@ class ElectrumXClient:
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    def _verify_pinned_fingerprint(self, ssl_socket: ssl.SSLSocket) -> bool:
+    def _verify_pinned_fingerprint(
+        self, ssl_socket: ssl.SSLSocket, host: Optional[str] = None
+    ) -> bool:
         """
         Vergleicht den SHA-256 Fingerprint des Server-Zertifikats gegen die
-        Allowlist in network['ssl_pinned_fingerprints'].
+        per-Host-Allowlist in network['ssl_pinned_fingerprints'].
         """
-        pinned = [
-            fp.lower().replace(":", "").replace(" ", "")
-            for fp in (self.network.get("ssl_pinned_fingerprints") or [])
-        ]
+        pinned = self._pinned_fingerprints_for_host(host)
         if not pinned:
-            return True  # Pinning nicht aktiv
+            return True  # Pinning für diesen Host nicht aktiv
 
         der_cert = ssl_socket.getpeercert(binary_form=True)
         if not der_cert:
@@ -181,57 +218,77 @@ class ElectrumXClient:
         Returns:
             True bei erfolgreicher Verbindung.
         """
-        last_error: Optional[Exception] = None
-
-        for server in self.servers:
+        with self._lock:
+            last_error: Optional[Exception] = None
+            # Guard: Während des Handshakes darf _call() KEINEN Reconnect
+            # auslösen, sonst entsteht Endlos-Rekursion
+            # connect → _call → _reconnect → connect.
+            self._connecting = True
             try:
+                for server in self.servers:
+                    try:
+                        self._cleanup()
+                        host = server["host"]
+                        port = server["port"]
+
+                        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self._socket.settimeout(self.timeout)
+                        # Tote/Idle-Verbindungen schnell erkennen (NAT-Timeouts etc.).
+                        self._setup_keepalive(self._socket)
+
+                        ctx = self._build_ssl_context(host)
+                        if self._socket is None:
+                            raise ConnectionError(
+                                f"create_connection({host}:{port}) lieferte None"
+                            )
+                        self._ssl_socket = ctx.wrap_socket(self._socket, server_hostname=host)
+                        self._ssl_socket.connect((host, port))
+
+                        # Pinning prüfen, falls für diesen Host aktiv
+                        if not self._verify_pinned_fingerprint(self._ssl_socket, host):
+                            self._cleanup()
+                            last_error = ssl.SSLError(
+                                f"Certificate-Pinning fehlgeschlagen für {host}: "
+                                f"Fingerprint nicht in ssl_pinned_fingerprints."
+                            )
+                            continue
+
+                        self._connected = True
+                        self._current_server = server
+                        self._recv_buffer = b""
+
+                        # Server-Version handshake – _retry=False, damit ein
+                        # Fehlschlag hier keinen Reconnect (und damit erneutes
+                        # connect()) auslöst.
+                        result = self._call(
+                            "server.version", ["doichain-wallet", "1.4"], _retry=False
+                        )
+                        if result:
+                            return True
+
+                    # RuntimeError (RPC-Fehlerantwort) und ValueError (inkl.
+                    # json.JSONDecodeError) müssen ebenfalls zum Failover auf den
+                    # nächsten Server führen, statt connect() abzubrechen.
+                    except (socket.error, ssl.SSLError, OSError,
+                            ConnectionRefusedError, ConnectionError,
+                            RuntimeError, json.JSONDecodeError, ValueError) as e:
+                        last_error = e
+                        self._cleanup()
+                        continue
+
+                if last_error is not None:
+                    print(f"⚠️  Kein ElectrumX-Server erreichbar. Letzter Fehler: {last_error}",
+                          file=sys.stderr)
+                # Keinen halb offenen Zustand zurücklassen.
                 self._cleanup()
-                host = server["host"]
-                port = server["port"]
-
-                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._socket.settimeout(self.timeout)
-                # Tote/Idle-Verbindungen schnell erkennen (NAT-Timeouts etc.).
-                self._setup_keepalive(self._socket)
-
-                ctx = self._build_ssl_context()
-                if self._socket is None:
-                    raise ConnectionError(f"create_connection({host}:{port}) lieferte None")
-                self._ssl_socket = ctx.wrap_socket(self._socket, server_hostname=host)
-                self._ssl_socket.connect((host, port))
-
-                # Pinning prüfen, falls aktiv
-                if not self._verify_pinned_fingerprint(self._ssl_socket):
-                    self._cleanup()
-                    last_error = ssl.SSLError(
-                        f"Certificate-Pinning fehlgeschlagen für {host}: "
-                        f"Fingerprint nicht in ssl_pinned_fingerprints."
-                    )
-                    continue
-
-                self._connected = True
-                self._current_server = server
-                self._recv_buffer = b""
-
-                # Server-Version handshake
-                result = self._call("server.version", ["doichain-wallet", "1.4"])
-                if result:
-                    return True
-
-            except (socket.error, ssl.SSLError, OSError,
-                    ConnectionRefusedError, ConnectionError) as e:
-                last_error = e
-                self._cleanup()
-                continue
-
-        if last_error is not None:
-            print(f"⚠️  Kein ElectrumX-Server erreichbar. Letzter Fehler: {last_error}",
-                  file=sys.stderr)
-        return False
+                return False
+            finally:
+                self._connecting = False
 
     def disconnect(self):
         """Verbindung trennen."""
-        self._cleanup()
+        with self._lock:
+            self._cleanup()
 
     def _cleanup(self):
         """Räumt Socket-Ressourcen auf."""
@@ -252,16 +309,35 @@ class ElectrumXClient:
 
     def _reconnect(self) -> bool:
         """Versucht, die Verbindung wiederherzustellen."""
-        self._cleanup()
-        return self.connect()
+        with self._lock:
+            if self._connecting:
+                # Wir befinden uns bereits in connect() (Handshake) –
+                # kein verschachtelter Reconnect (Endlos-Rekursions-Schutz).
+                return False
+            self._cleanup()
+            return self.connect()
 
     # ========================================================
     # RPC
     # ========================================================
 
+    # Obergrenze für den Empfangspuffer. Eine Zeile ohne '\n' jenseits dieser
+    # Grenze ist entweder ein fehlerhafter/bösartiger Server oder ein
+    # Protokollfehler – Verbindung wird zurückgesetzt.
+    MAX_RECV_BUFFER = 16 * 1024 * 1024  # 16 MB
+
     def _call(self, method: str, params: list = None, _retry: bool = True) -> any:
         """
         JSON-RPC Aufruf an den ElectrumX-Server.
+
+        Thread-sicher: Der komplette Sende-/Empfangszyklus läuft unter
+        self._lock (RLock), damit GUI-Threads sich Request-IDs, Puffer und
+        Socket nicht gegenseitig zerschießen.
+
+        Antworten werden anhand der JSON-RPC 'id' dem Request zugeordnet.
+        Asynchrone Server-Notifications (z.B. blockchain.headers.subscribe
+        nach get_tip()) sowie veraltete Antworten werden NICHT als Ergebnis
+        fehlinterpretiert, sondern verarbeitet (Tip-Cache) bzw. verworfen.
 
         Args:
             method: RPC-Methode (z.B. "blockchain.scripthash.get_balance").
@@ -275,48 +351,100 @@ class ElectrumXClient:
             ConnectionError: Bei Verbindungsproblemen, die auch nach Reconnect bestehen.
             RuntimeError: Bei RPC-Fehlern vom Server.
         """
-        if not self._ssl_socket:
-            raise ConnectionError("Nicht verbunden. Zuerst connect() aufrufen.")
+        with self._lock:
+            if not self._ssl_socket:
+                raise ConnectionError("Nicht verbunden. Zuerst connect() aufrufen.")
 
-        self._request_id += 1
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": method,
-            "params": params or [],
-        }
-        msg = (json.dumps(request) + "\n").encode("utf-8")
+            self._request_id += 1
+            request_id = self._request_id
+            request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or [],
+            }
+            msg = (json.dumps(request) + "\n").encode("utf-8")
 
-        try:
-            self._ssl_socket.sendall(msg)
+            try:
+                self._ssl_socket.sendall(msg)
+                response = self._recv_response(request_id)
+            except (socket.error, ssl.SSLError, ConnectionError, OSError) as e:
+                # Einmaliger Reconnect-Versuch (in connect() unterdrückt
+                # _reconnect() sich selbst, siehe self._connecting).
+                if _retry and self._reconnect():
+                    return self._call(method, params, _retry=False)
+                raise ConnectionError(f"Verbindung verloren: {e}") from e
+
+            if "error" in response and response["error"]:
+                raise RuntimeError(f"ElectrumX Fehler: {response['error']}")
+
+            return response.get("result")
+
+    def _recv_response(self, request_id: int) -> dict:
+        """
+        Liest Zeilen vom Server, bis die Antwort mit der passenden JSON-RPC
+        'id' eintrifft (Timeout: self.timeout).
+
+        Zeilen ohne 'id' bzw. mit fremder 'id' sind asynchrone Notifications
+        (z.B. blockchain.headers.subscribe) oder veraltete Antworten:
+          - Header-Notifications aktualisieren den Tip-Cache (self._cached_tip),
+          - alles andere wird verworfen.
+        """
+        deadline = time.monotonic() + self.timeout
+
+        while True:
+            if time.monotonic() > deadline:
+                raise socket.timeout(
+                    f"Timeout: keine Antwort mit id={request_id} "
+                    f"innerhalb von {self.timeout}s"
+                )
+
             line = self._recv_line()
-        except (socket.error, ssl.SSLError, ConnectionError, OSError) as e:
-            # Einmaliger Reconnect-Versuch
-            if _retry and self._reconnect():
-                return self._call(method, params, _retry=False)
-            raise ConnectionError(f"Verbindung verloren: {e}") from e
+            try:
+                message = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # Protokollfehler – Verbindung gilt als kaputt, damit der
+                # Reconnect-Pfad in _call() greifen kann.
+                raise ConnectionError(f"Ungültige JSON-Zeile vom Server: {e}") from e
 
-        response = json.loads(line.decode("utf-8"))
+            if not isinstance(message, dict):
+                continue  # Unbrauchbare Zeile verwerfen
 
-        if "error" in response and response["error"]:
-            raise RuntimeError(f"ElectrumX Fehler: {response['error']}")
+            msg_id = message.get("id")
+            if msg_id == request_id:
+                return message  # Unsere Antwort
 
-        return response.get("result")
+            if msg_id is None:
+                # Notification (keine 'id'): Header-Notifications cachen,
+                # alles andere verwerfen.
+                if message.get("method") == "blockchain.headers.subscribe":
+                    n_params = message.get("params") or []
+                    if n_params:
+                        self._cached_tip = n_params[0]
+                continue
+
+            # Fremde/veraltete 'id' (stale Antwort) – verwerfen und weiterlesen.
+            continue
 
     def _recv_line(self) -> bytes:
         """
-        Liest eine vollständige, mit '\\n' terminierte JSON-Antwortzeile aus
-        dem Socket. Restliche bereits empfangene Bytes werden gepuffert und
-        beim nächsten Aufruf zuerst verarbeitet (wichtig für asynchrone
+        Liest eine vollständige, mit '\\n' terminierte JSON-Zeile aus dem
+        Socket. Restliche bereits empfangene Bytes werden gepuffert und beim
+        nächsten Aufruf zuerst verarbeitet (wichtig für asynchrone
         Server-Notifications und große Antworten).
-        """
-        # Hinweis: subscriptions (z.B. blockchain.headers.subscribe) liefern
-        # asynchrone Notifications. Diese würden hier als Antwortzeile
-        # interpretiert werden – aktuell verwendet der Wallet keine
-        # langlebigen Subscriptions, daher okay. TODO: Bei späterem
-        # Subscription-Support nach 'id' vs. notification differenzieren.
 
+        Der Puffer ist auf MAX_RECV_BUFFER begrenzt: Läuft er ohne Newline
+        voll, wird die Verbindung zurückgesetzt und ConnectionError geworfen.
+        """
         while b"\n" not in self._recv_buffer:
+            if len(self._recv_buffer) > self.MAX_RECV_BUFFER:
+                size = len(self._recv_buffer)
+                # Verbindung zurücksetzen – der Puffer ist nicht mehr vertrauenswürdig.
+                self._cleanup()
+                raise ConnectionError(
+                    f"Empfangspuffer-Limit überschritten "
+                    f"({size} > {self.MAX_RECV_BUFFER} Bytes ohne Newline)"
+                )
             chunk = self._ssl_socket.recv(65536)
             if not chunk:
                 raise ConnectionError("Verbindung geschlossen (recv 0 bytes)")
@@ -418,7 +546,10 @@ class ElectrumXClient:
 
     def get_tip(self) -> dict:
         """Gibt den aktuellen Blockchain-Tip (neuester Block) zurück."""
-        return self._call("blockchain.headers.subscribe", [])
+        result = self._call("blockchain.headers.subscribe", [])
+        if result:
+            self._cached_tip = result
+        return result
 
     def get_fee_estimate(self, target_blocks: int = 6) -> Optional[float]:
         """

@@ -60,10 +60,11 @@ if exist "dist\DOI-Wallet-iX.exe" (
     echo.
     echo   EXE: dist\DOI-Wallet-iX.exe
     echo.
-    if exist "config\config.yaml" (
+    REM WICHTIG: Niemals die echte config.yaml ausliefern - sie enthaelt API-Keys!
+    if exist "config\config.example.yaml" (
         if not exist "dist\config" mkdir "dist\config"
-        copy "config\config.yaml" "dist\config\" >nul
-        echo   Config kopiert nach dist\config\
+        copy "config\config.example.yaml" "dist\config\" >nul
+        echo   Beispiel-Config kopiert nach dist\config\
     )
     echo  ============================================
 ) else (

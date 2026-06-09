@@ -69,6 +69,80 @@ TRON_NILE_TESTNET = {
 
 
 # ──────────────────────────────────────────────
+# Minimaler Protobuf-Reader (für Transaktions-Verifizierung)
+# ──────────────────────────────────────────────
+
+def _pb_read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
+    """Liest einen Protobuf-Varint. Gibt (Wert, neue Position) zurück."""
+    result = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("Protobuf-Varint überschreitet Pufferende")
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return result, pos
+        shift += 7
+        if shift > 70:
+            raise ValueError("Protobuf-Varint zu lang")
+
+
+def _pb_parse_fields(buf: bytes) -> List[Tuple[int, int, Any]]:
+    """
+    Parst eine Protobuf-Nachricht in eine Liste von Feldern.
+
+    Returns:
+        Liste von (field_number, wire_type, value):
+        - wire_type 0 (Varint): value = int
+        - wire_type 1 (64-Bit) / 5 (32-Bit): value = bytes
+        - wire_type 2 (Length-Delimited): value = bytes
+    """
+    fields = []
+    pos = 0
+    while pos < len(buf):
+        tag, pos = _pb_read_varint(buf, pos)
+        field_no = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:  # Varint
+            value, pos = _pb_read_varint(buf, pos)
+        elif wire_type == 2:  # Length-Delimited
+            length, pos = _pb_read_varint(buf, pos)
+            if pos + length > len(buf):
+                raise ValueError("Protobuf-Feld überschreitet Pufferende")
+            value = buf[pos:pos + length]
+            pos += length
+        elif wire_type == 5:  # 32-Bit
+            if pos + 4 > len(buf):
+                raise ValueError("Protobuf-Feld überschreitet Pufferende")
+            value = buf[pos:pos + 4]
+            pos += 4
+        elif wire_type == 1:  # 64-Bit
+            if pos + 8 > len(buf):
+                raise ValueError("Protobuf-Feld überschreitet Pufferende")
+            value = buf[pos:pos + 8]
+            pos += 8
+        else:
+            raise ValueError(f"Unbekannter Protobuf-Wire-Type: {wire_type}")
+        fields.append((field_no, wire_type, value))
+    return fields
+
+
+def _pb_get_fields(fields: List[Tuple[int, int, Any]], field_no: int) -> List[Any]:
+    """Gibt alle Werte eines Feldes (repeated) zurück."""
+    return [value for fn, _, value in fields if fn == field_no]
+
+
+def _pb_get_field(fields: List[Tuple[int, int, Any]], field_no: int, default=None) -> Any:
+    """Gibt den ersten Wert eines Feldes zurück (oder default)."""
+    for fn, _, value in fields:
+        if fn == field_no:
+            return value
+    return default
+
+
+# ──────────────────────────────────────────────
 # TronGrid Client
 # ──────────────────────────────────────────────
 
@@ -107,42 +181,82 @@ class TronClient:
     # Low-Level API
     # ──────────────────────────────────────────
     
-    def _get(self, endpoint: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
-        """GET-Request an TronGrid API."""
+    # Bei HTTP 429 (Rate-Limit, v.a. ohne API-Key) wird mit Backoff erneut
+    # versucht. Das ist auch für broadcasttransaction sicher: Die signierte
+    # Transaktion ist idempotent (gleiche txID), ein erneuter Broadcast
+    # derselben TX kann nicht doppelt ausgeführt werden.
+    _RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+    def _request(self, method: str, endpoint: str, *, params: dict = None,
+                 data: dict = None, timeout: int = 15) -> dict:
+        """
+        HTTP-Request an TronGrid API mit Retry bei Rate-Limit (429).
+
+        Raises:
+            ConnectionError: Bei Netzwerk- oder HTTP-Fehlern (damit Fehler
+                             nicht fälschlich als Saldo 0 interpretiert werden)
+        """
         url = f"{self.base_url}{endpoint}"
-        try:
-            resp = self._session.get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"TronGrid GET {endpoint} fehlgeschlagen: {e}")
-            return None
-    
-    def _post(self, endpoint: str, data: dict = None, timeout: int = 15) -> Optional[dict]:
-        """POST-Request an TronGrid API."""
-        url = f"{self.base_url}{endpoint}"
-        try:
-            resp = self._session.post(url, json=data or {}, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"TronGrid POST {endpoint} fehlgeschlagen: {e}")
-            return None
+        last_error = None
+        for attempt, delay in enumerate((0.0,) + self._RETRY_DELAYS):
+            if delay:
+                logger.warning(
+                    f"TronGrid Rate-Limit (429) auf {endpoint} – "
+                    f"warte {delay:.0f}s und versuche erneut "
+                    f"({attempt}/{len(self._RETRY_DELAYS)})"
+                )
+                time.sleep(delay)
+            try:
+                if method == "GET":
+                    resp = self._session.get(url, params=params, timeout=timeout)
+                else:
+                    resp = self._session.post(url, json=data or {}, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if e.response is not None and e.response.status_code == 429:
+                    continue  # Rate-Limit → Backoff und erneut versuchen
+                logger.error(f"TronGrid {method} {endpoint} fehlgeschlagen: {e}")
+                raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+            except requests.exceptions.RequestException as e:
+                logger.error(f"TronGrid {method} {endpoint} fehlgeschlagen: {e}")
+                raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+        logger.error(f"TronGrid {method} {endpoint}: Rate-Limit trotz Retries")
+        raise ConnectionError(
+            "TronGrid Rate-Limit (429) – auch nach mehreren Versuchen. "
+            "Tipp: Kostenlosen API-Key auf trongrid.io erstellen und in "
+            "config.yaml unter tron.api_key eintragen."
+        ) from last_error
+
+    def _get(self, endpoint: str, params: dict = None, timeout: int = 15) -> dict:
+        """GET-Request an TronGrid API (mit 429-Retry, siehe _request)."""
+        return self._request("GET", endpoint, params=params, timeout=timeout)
+
+    def _post(self, endpoint: str, data: dict = None, timeout: int = 15) -> dict:
+        """POST-Request an TronGrid API (mit 429-Retry, siehe _request)."""
+        return self._request("POST", endpoint, data=data, timeout=timeout)
     
     # ──────────────────────────────────────────
     # Netzwerk-Status
     # ──────────────────────────────────────────
     
     def get_block_height(self) -> Optional[int]:
-        """Gibt die aktuelle Blockhöhe zurück."""
-        data = self._post("/wallet/getnowblock")
+        """Gibt die aktuelle Blockhöhe zurück (None bei Netzwerkfehler)."""
+        try:
+            data = self._post("/wallet/getnowblock")
+        except ConnectionError:
+            return None
         if data:
             return data.get("block_header", {}).get("raw_data", {}).get("number")
         return None
-    
+
     def get_chain_parameters(self) -> Optional[List[dict]]:
-        """Gibt die Tron-Chain-Parameter zurück."""
-        data = self._get("/wallet/getchainparameters")
+        """Gibt die Tron-Chain-Parameter zurück (None bei Netzwerkfehler)."""
+        try:
+            data = self._get("/wallet/getchainparameters")
+        except ConnectionError:
+            return None
         if data:
             return data.get("chainParameter", [])
         return None
@@ -161,28 +275,36 @@ class TronClient:
         
         Args:
             address: Tron-Adresse (Base58Check oder Hex)
-        
+
         Returns:
-            Account-Daten oder None
+            Account-Daten oder None (wenn der Account nicht existiert)
+
+        Raises:
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
         """
         data = self._post("/wallet/getaccount", {
             "address": address,
             "visible": True,
         })
         return data if data and "address" in data else None
-    
+
     def get_trx_balance(self, address: str) -> int:
         """
         Gibt den TRX-Saldo in SUN zurück.
-        
+
         Args:
             address: Tron-Adresse
-        
+
         Returns:
             Saldo in SUN (1 TRX = 1.000.000 SUN), 0 wenn Account nicht existiert
+
+        Raises:
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
+                             (Netzwerkfehler werden NICHT als Saldo 0 maskiert)
         """
         account = self.get_account(address)
         if account is None:
+            # Account existiert (noch) nicht auf der Chain → Saldo 0
             return 0
         return account.get("balance", 0)
     
@@ -212,16 +334,21 @@ class TronClient:
         
         Returns:
             Token-Saldo in Raw-Einheiten (für USDT: 6 Dezimalstellen)
+
+        Raises:
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
+                             (Netzwerkfehler werden NICHT als Saldo 0 maskiert)
+            ValueError: Bei ungültiger Adresse oder Contract-Adresse
         """
         if contract is None:
             contract = self.network["usdt_contract"]
-        
+
         # TriggerConstantContract: balanceOf(address)
         owner_hex = tron_address_to_hex(address)
         contract_hex = tron_address_to_hex(contract)
-        
+
         if not owner_hex or not contract_hex:
-            return 0
+            raise ValueError(f"Ungültige Adresse oder Contract: {address} / {contract}")
         
         # ABI: balanceOf(address) = 0x70a08231 + padded address
         # Adresse: 20 Bytes → links mit Nullen auf 32 Bytes padden
@@ -410,42 +537,183 @@ class TronClient:
     # Signierung & Broadcast
     # ──────────────────────────────────────────
     
-    def sign_and_broadcast(self, unsigned_tx: dict, private_key: bytes) -> Optional[dict]:
+    def sign_and_broadcast(
+        self,
+        unsigned_tx: dict,
+        private_key: bytes,
+        expected: Optional[dict] = None,
+    ) -> dict:
         """
         Signiert eine Transaktion lokal und sendet sie ans Netzwerk.
-        
+
+        SICHERHEIT: Es wird NIEMALS blind die vom Server gelieferte txID
+        signiert. Stattdessen wird der Hash lokal aus raw_data_hex berechnet
+        und gegen die txID geprüft. Optional wird zusätzlich der Inhalt der
+        Transaktion (Empfänger, Betrag, Contract) gegen die ursprüngliche
+        Anforderung verifiziert.
+
         Args:
             unsigned_tx: Unsignierte Transaktion (von create_*_transfer)
             private_key: 32-Byte Private Key
-        
+            expected: Optionale erwartete Transaktionsdaten zur Verifizierung:
+                TRX-Transfer:
+                    {"type": "TransferContract",
+                     "owner_address": "41..." (Hex),
+                     "to_address": "41..." (Hex),
+                     "amount": <int, SUN>}
+                TRC-20-Transfer:
+                    {"type": "TriggerSmartContract",
+                     "owner_address": "41..." (Hex),
+                     "contract_address": "41..." (Hex),
+                     "to_address": "41..." (Hex),
+                     "amount": <int, Raw-Einheiten>}
+
         Returns:
-            Broadcast-Ergebnis oder None
+            Broadcast-Ergebnis: {"txID": ..., "result": ...}
+
+        Raises:
+            RuntimeError: Wenn raw_data_hex fehlt, die txID nicht zum lokal
+                          berechneten Hash passt, die Transaktionsdaten von
+                          der Anforderung abweichen oder der Broadcast
+                          fehlschlägt
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
         """
         # txID ist der Hash der raw_data
         tx_id = unsigned_tx.get("txID")
         if not tx_id:
-            logger.error("Transaktion hat keine txID")
-            return None
-        
-        tx_hash = bytes.fromhex(tx_id)
-        
-        # Signieren
+            raise RuntimeError("Transaktion hat keine txID")
+
+        # SICHERHEIT 1: txID lokal aus raw_data_hex nachrechnen –
+        # niemals blind den vom Server gelieferten Hash signieren!
+        raw_data_hex = unsigned_tx.get("raw_data_hex")
+        if not raw_data_hex:
+            raise RuntimeError(
+                "Transaktion hat kein raw_data_hex – Signierung verweigert "
+                "(blindes Signieren der Server-txID wäre unsicher)"
+            )
+
+        try:
+            raw_data = bytes.fromhex(raw_data_hex)
+        except ValueError as e:
+            raise RuntimeError(f"Ungültiges raw_data_hex: {e}") from e
+
+        tx_hash = sha256(raw_data)
+        if tx_hash.hex() != tx_id.lower():
+            raise RuntimeError(
+                "txID stimmt nicht mit SHA-256(raw_data_hex) überein — "
+                "möglicher Angriff, Signierung abgebrochen"
+            )
+
+        # SICHERHEIT 2: Inhalt der Transaktion gegen die ursprüngliche
+        # Anforderung verifizieren (Empfänger, Betrag, Contract)
+        if expected is not None:
+            self._verify_raw_data(raw_data, expected)
+
+        # Signieren (lokal berechneter Hash, nicht die Server-txID)
         signature = sign_transaction(tx_hash, private_key)
-        
+
         # Signatur zur Transaktion hinzufügen
         signed_tx = unsigned_tx.copy()
         signed_tx["signature"] = [signature.hex()]
-        
+
         # Broadcast
         result = self._post("/wallet/broadcasttransaction", signed_tx)
-        
+
         if result and result.get("result", False):
             logger.info(f"Transaktion gesendet: {tx_id}")
             return {"txID": tx_id, "result": result}
+
+        msg = result.get("message", "Unbekannter Fehler") if result else "Keine Antwort"
+        try:
+            # TronGrid liefert Fehlermeldungen oft Hex-kodiert
+            msg = bytes.fromhex(msg).decode("utf-8", errors="ignore")
+        except (ValueError, TypeError):
+            pass
+        logger.error(f"Broadcast fehlgeschlagen: {msg}")
+        raise RuntimeError(f"Broadcast fehlgeschlagen: {msg}")
+
+    @staticmethod
+    def _verify_raw_data(raw_data: bytes, expected: dict) -> None:
+        """
+        Verifiziert die dekodierte Transaktion (Tron-Protobuf) gegen die
+        erwarteten Daten. Wirft RuntimeError bei jeder Abweichung.
+
+        Schema (Tron Transaction.raw):
+            Feld 11 = repeated Contract
+            Contract: Feld 1 = type (Varint), Feld 2 = parameter (Any)
+            Any: Feld 1 = type_url, Feld 2 = value
+        """
+        mismatch = RuntimeError(
+            "Transaktionsdaten vom Server weichen von der Anforderung ab "
+            "— möglicher Angriff"
+        )
+
+        try:
+            raw_fields = _pb_parse_fields(raw_data)
+            contracts = _pb_get_fields(raw_fields, 11)
+        except ValueError as e:
+            raise RuntimeError(f"Transaktion nicht dekodierbar: {e}") from e
+
+        # Es darf genau EIN Contract enthalten sein
+        if len(contracts) != 1:
+            raise mismatch
+
+        try:
+            contract_fields = _pb_parse_fields(contracts[0])
+            any_fields = _pb_parse_fields(_pb_get_field(contract_fields, 2, b""))
+            type_url = _pb_get_field(any_fields, 1, b"").decode("utf-8", errors="replace")
+            value = _pb_get_field(any_fields, 2, b"")
+            param_fields = _pb_parse_fields(value)
+        except ValueError as e:
+            raise RuntimeError(f"Contract nicht dekodierbar: {e}") from e
+
+        expected_type = expected.get("type", "")
+
+        if type_url.endswith("TransferContract") and expected_type == "TransferContract":
+            # TRX-Transfer: Feld 1 = owner, Feld 2 = to, Feld 3 = amount
+            owner = _pb_get_field(param_fields, 1, b"")
+            to = _pb_get_field(param_fields, 2, b"")
+            amount = _pb_get_field(param_fields, 3, 0)
+
+            if owner.hex() != expected["owner_address"].lower():
+                raise mismatch
+            if to.hex() != expected["to_address"].lower():
+                raise mismatch
+            if amount != int(expected["amount"]):
+                raise mismatch
+
+        elif type_url.endswith("TriggerSmartContract") and expected_type == "TriggerSmartContract":
+            # TRC-20: Feld 1 = owner, Feld 2 = contract, Feld 4 = ABI-Daten
+            owner = _pb_get_field(param_fields, 1, b"")
+            contract_addr = _pb_get_field(param_fields, 2, b"")
+            call_data = _pb_get_field(param_fields, 4, b"")
+
+            if owner.hex() != expected["owner_address"].lower():
+                raise mismatch
+            if contract_addr.hex() != expected["contract_address"].lower():
+                raise mismatch
+
+            # ABI: transfer(address,uint256) = Selector a9059cbb
+            #      + 32 Bytes gepaddete Empfänger-Adresse + 32 Bytes Betrag
+            if len(call_data) != 68 or call_data[:4] != bytes.fromhex("a9059cbb"):
+                raise mismatch
+
+            # Empfänger: letzte 20 Bytes des ersten Parameters
+            # (Padding davor muss Null sein)
+            if call_data[4:16] != b"\x00" * 12:
+                raise mismatch
+            abi_to = call_data[16:36]
+            # expected to_address ist 21 Bytes Hex mit 0x41-Prefix
+            if abi_to.hex() != expected["to_address"].lower()[2:]:
+                raise mismatch
+
+            abi_value = int.from_bytes(call_data[36:68], "big")
+            if abi_value != int(expected["amount"]):
+                raise mismatch
+
         else:
-            msg = result.get("message", "Unbekannter Fehler") if result else "Keine Antwort"
-            logger.error(f"Broadcast fehlgeschlagen: {msg}")
-            return {"txID": tx_id, "error": msg, "result": result}
+            # Contract-Typ passt nicht zur Anforderung
+            raise mismatch
     
     # ──────────────────────────────────────────
     # Transaktions-Status

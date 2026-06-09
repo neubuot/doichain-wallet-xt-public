@@ -35,6 +35,7 @@ Verwendung:
 """
 
 import base64
+import hmac
 import json
 import logging
 import os
@@ -76,6 +77,12 @@ DEFAULT_KDF_PARAMS = {
     "key_len": 32,  # 256 Bit
 }
 
+# Obergrenzen für KDF-Parameter aus Wallet-Dateien.
+# Verhindert DoS durch manipulierte Dateien mit absurd hohen Kosten.
+KDF_MAX_N = 2**22
+KDF_MAX_R = 32
+KDF_MAX_P = 16
+
 # Unterstützte Chains
 SUPPORTED_CHAINS = ("DOI", "TRX", "USDT", "ETH", "wDOI")
 
@@ -107,6 +114,45 @@ def _derive_key(password: str, salt: bytes, params: dict = None) -> bytes:
     )
 
 
+def _sanitize_kdf_params(params: Optional[dict]) -> dict:
+    """
+    Validiert KDF-Parameter aus einer Wallet-Datei.
+
+    Obergrenzen verhindern Denial-of-Service durch manipulierte Dateien
+    mit absurd hohen scrypt-Kosten.
+
+    Args:
+        params: kdf_params aus der Wallet-Datei (oder None)
+
+    Returns:
+        Bereinigte Parameter (n, r, p, key_len)
+
+    Raises:
+        ValueError: Bei ungültigen oder zu teuren Parametern
+    """
+    if not params:
+        return dict(DEFAULT_KDF_PARAMS)
+
+    try:
+        n = int(params.get("n", DEFAULT_KDF_PARAMS["n"]))
+        r = int(params.get("r", DEFAULT_KDF_PARAMS["r"]))
+        p = int(params.get("p", DEFAULT_KDF_PARAMS["p"]))
+        key_len = int(params.get("key_len", DEFAULT_KDF_PARAMS["key_len"]))
+    except (TypeError, ValueError):
+        raise ValueError("Ungültige KDF-Parameter in der Wallet-Datei")
+
+    if not (1 < n <= KDF_MAX_N) or (n & (n - 1)) != 0:
+        raise ValueError(f"Ungültiger KDF-Parameter n={n} (max. {KDF_MAX_N}, Zweierpotenz)")
+    if not (1 <= r <= KDF_MAX_R):
+        raise ValueError(f"Ungültiger KDF-Parameter r={r} (max. {KDF_MAX_R})")
+    if not (1 <= p <= KDF_MAX_P):
+        raise ValueError(f"Ungültiger KDF-Parameter p={p} (max. {KDF_MAX_P})")
+    if key_len != 32:
+        raise ValueError(f"Ungültige KDF-Schlüssellänge: {key_len} (erwartet: 32)")
+
+    return {"n": n, "r": r, "p": p, "key_len": key_len}
+
+
 def _encrypt(data: bytes, password: str) -> dict:
     """
     Verschlüsselt Daten mit AES-256-GCM.
@@ -128,13 +174,16 @@ def _encrypt(data: bytes, password: str) -> dict:
     }
 
 
-def _decrypt(enc: dict, password: str) -> bytes:
+def _decrypt(enc: dict, password: str, kdf_params: dict = None) -> bytes:
     """
     Entschlüsselt AES-256-GCM-verschlüsselte Daten.
 
     Args:
         enc: Dict mit salt, nonce, ciphertext, tag
         password: Benutzer-Passwort
+        kdf_params: KDF-Parameter aus der Wallet-Datei
+                    (default: DEFAULT_KDF_PARAMS; werden vor Verwendung
+                    mit Obergrenzen validiert, siehe _sanitize_kdf_params)
 
     Returns:
         Entschlüsselte Daten
@@ -147,7 +196,7 @@ def _decrypt(enc: dict, password: str) -> bytes:
     ciphertext = base64.b64decode(enc["ciphertext"])
     tag = base64.b64decode(enc["tag"])
 
-    key = _derive_key(password, salt)
+    key = _derive_key(password, salt, _sanitize_kdf_params(kdf_params))
 
     try:
         cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
@@ -257,12 +306,22 @@ class WalletManager:
         if not self._mnemonic:
             raise RuntimeError("Kein Mnemonic vorhanden")
 
+        # Netzwerke aus den gespeicherten Settings auflösen
+        # (z.B. nach load() einer Testnet-Wallet-Datei)
+        doi_net_name = str(self._settings.get("doi_network", "mainnet")).lower()
+        doi_network = DOI_TESTNET if doi_net_name in ("testnet", "test") else DOI_MAINNET
+
+        tron_net_name = str(self._settings.get("tron_network", "mainnet")).lower()
+        tron_network = (
+            TRON_NILE_TESTNET if tron_net_name in ("testnet", "test", "nile") else TRON_MAINNET
+        )
+
         # DOI Wallet
-        self.doi = DoiWallet()
+        self.doi = DoiWallet(network=doi_network)
         self.doi.restore(self._mnemonic, passphrase)
 
         # Tron Wallet
-        self.tron = TronWallet(api_key=self._tron_api_key)
+        self.tron = TronWallet(network=tron_network, api_key=self._tron_api_key)
         self.tron.restore(self._mnemonic, passphrase)
 
         # Ethereum / wDOI Wallet
@@ -300,6 +359,16 @@ class WalletManager:
         # Mnemonic verschlüsseln
         encrypted = _encrypt(self._mnemonic.encode("utf-8"), self._password)
 
+        # Nicht-sensibler Adress-Fingerprint (erste DOI-Empfangsadresse).
+        # Erlaubt beim Laden die Erkennung einer falschen/fehlenden
+        # BIP-39-Passphrase, ohne Geheimnisse preiszugeben.
+        fingerprint = None
+        if self.doi and self.doi.seed_manager.is_initialized:
+            try:
+                fingerprint = self.doi.seed_manager.get_receive_address(0)
+            except Exception as e:
+                logger.warning(f"Adress-Fingerprint konnte nicht abgeleitet werden: {e}")
+
         # Wallet-Datei zusammenbauen
         wallet_data = {
             "version": WALLET_FILE_VERSION,
@@ -313,13 +382,21 @@ class WalletManager:
                 "r": DEFAULT_KDF_PARAMS["r"],
                 "p": DEFAULT_KDF_PARAMS["p"],
             },
+            "address_fingerprint": fingerprint,
             "settings": self._settings,
         }
 
-        # Atomar schreiben (erst temp, dann umbenennen)
-        temp_path = filepath.with_suffix(".tmp")
-        with open(temp_path, "w") as f:
+        # Atomar schreiben (erst temp, dann umbenennen).
+        # Suffix anhängen statt ersetzen, damit z.B. a.dat und a.json
+        # nicht beide auf a.tmp kollidieren.
+        temp_path = filepath.with_suffix(filepath.suffix + ".tmp")
+        # Restriktive Dateirechte (0o600) direkt beim Anlegen setzen.
+        # Unter Windows ist der Modus weitgehend wirkungslos – unkritisch.
+        fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(wallet_data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
 
         temp_path.replace(filepath)
         self._wallet_path = filepath
@@ -334,20 +411,22 @@ class WalletManager:
         logger.info(f"Wallet gespeichert: {filepath}")
         return str(filepath)
 
-    def load(self, path: str, password: str) -> dict:
+    def load(self, path: str, password: str, passphrase: str = "") -> dict:
         """
         Lädt ein verschlüsseltes Wallet von der Festplatte.
 
         Args:
             path: Dateipfad
             password: Passwort zum Entschlüsseln
+            passphrase: Optionale BIP-39 Passphrase (muss mit der beim
+                        Erstellen/Wiederherstellen verwendeten übereinstimmen)
 
         Returns:
             Dict mit primären Adressen {doi, tron}
 
         Raises:
             FileNotFoundError: Datei nicht gefunden
-            ValueError: Falsches Passwort
+            ValueError: Falsches Passwort oder falsche Passphrase
         """
         filepath = Path(path)
         if not filepath.exists():
@@ -361,6 +440,11 @@ class WalletManager:
         if version != WALLET_FILE_VERSION:
             raise ValueError(f"Inkompatible Wallet-Version: {version} (erwartet: {WALLET_FILE_VERSION})")
 
+        # KDF-Parameter aus der Datei validieren (Obergrenzen gegen DoS,
+        # siehe _sanitize_kdf_params) – VOR dem Entschlüsseln, damit
+        # ein Parameter-Fehler nicht als "Falsches Passwort" maskiert wird
+        kdf_params = _sanitize_kdf_params(wallet_data.get("kdf_params"))
+
         # Entschlüsseln
         enc = {
             "salt": wallet_data["salt"],
@@ -370,7 +454,7 @@ class WalletManager:
         }
 
         try:
-            plaintext = _decrypt(enc, password)
+            plaintext = _decrypt(enc, password, kdf_params)
             self._mnemonic = plaintext.decode("utf-8")
         except ValueError:
             raise ValueError("Falsches Passwort!")
@@ -380,8 +464,25 @@ class WalletManager:
         self._settings = wallet_data.get("settings", self._settings)
         self._settings["last_accessed"] = datetime.now(timezone.utc).isoformat()
 
-        # Sub-Wallets initialisieren
-        self._init_wallets()
+        # Sub-Wallets initialisieren (mit BIP-39 Passphrase)
+        self._init_wallets(passphrase)
+
+        # Adress-Fingerprint prüfen: erkennt eine falsche/fehlende
+        # BIP-39 Passphrase, statt stillschweigend leere Wallets zu zeigen.
+        fingerprint = wallet_data.get("address_fingerprint")
+        if fingerprint and self.doi and self.doi.seed_manager.is_initialized:
+            derived = self.doi.seed_manager.get_receive_address(0)
+            if derived != fingerprint:
+                # Sensible Daten wieder entfernen
+                self._mnemonic = None
+                self._password = None
+                self.doi = None
+                self.tron = None
+                self.eth = None
+                raise ValueError(
+                    "Passphrase oder Wallet-Daten stimmen nicht überein – "
+                    "bitte BIP-39 Passphrase prüfen"
+                )
 
         # State-Datei lesen, falls vorhanden, und in DOI-Wallet einspielen.
         # Bei Fehlern oder fehlender Datei: kein Problem, beim nächsten
@@ -420,6 +521,51 @@ class WalletManager:
 
         logger.info("Passwort geändert")
         return True
+
+    def verify_password(self, password: str) -> bool:
+        """
+        Prüft ein Passwort gegen das geladene Wallet, ohne Geheimnisse
+        preiszugeben.
+
+        Bevorzugt wird der Schlüssel mit Salt/KDF-Parametern aus der
+        gespeicherten Wallet-Datei neu abgeleitet und eine Entschlüsselung
+        versucht (scrypt-Kosten sind hier akzeptabel). Ist das Wallet noch
+        nicht gespeichert (direkt nach create()/restore()), wird das
+        Passwort zeitkonstant (hmac.compare_digest) mit dem im Speicher
+        gehaltenen Passwort verglichen.
+
+        Args:
+            password: Zu prüfendes Passwort
+
+        Returns:
+            True wenn das Passwort korrekt ist, sonst False
+            (auch wenn kein Wallet geladen ist)
+        """
+        if not isinstance(password, str):
+            return False
+
+        # Bevorzugt: gegen die gespeicherte Wallet-Datei prüfen
+        if self._wallet_path and self._wallet_path.exists():
+            try:
+                with open(self._wallet_path, "r") as f:
+                    wallet_data = json.load(f)
+                enc = {
+                    "salt": wallet_data["salt"],
+                    "nonce": wallet_data["nonce"],
+                    "ciphertext": wallet_data["encrypted_seed"],
+                    "tag": wallet_data["tag"],
+                }
+                _decrypt(enc, password, wallet_data.get("kdf_params"))
+                return True
+            except Exception:
+                return False
+
+        # Fallback: Wallet existiert nur im Speicher (vor dem ersten save())
+        if self._password is None:
+            return False
+        return hmac.compare_digest(
+            password.encode("utf-8"), self._password.encode("utf-8")
+        )
 
     # ──────────────────────────────────────────
     # Adressen
@@ -701,7 +847,7 @@ class WalletManager:
 
         if self.doi:
             try:
-                result["doi"] = self.doi.electrumx is not None
+                result["doi"] = self.doi.electrum is not None
             except Exception:
                 result["doi"] = False
 
@@ -773,10 +919,14 @@ class WalletManager:
             except Exception as e:
                 logger.warning(f"DoiWallet.get_state() fehlgeschlagen: {e}")
 
-        # Atomar schreiben
+        # Atomar schreiben, mit restriktiven Dateirechten (0o600).
+        # Unter Windows ist der Modus weitgehend wirkungslos – unkritisch.
         tmp = state_path.with_suffix(state_path.suffix + ".tmp")
-        with open(tmp, "w") as f:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(state_path)
         return str(state_path)
 
@@ -803,7 +953,8 @@ class WalletManager:
         if self.tron:
             self.tron.close()
 
-        # Sensible Daten überschreiben
+        # Sensible Daten entfernen (siehe Hinweis in lock(): Python-Strings
+        # sind unveränderlich, echtes Memory-Wiping ist hier nicht möglich)
         if self._mnemonic:
             self._mnemonic = "x" * len(self._mnemonic)
         self._mnemonic = None
@@ -823,10 +974,15 @@ class WalletManager:
         if not self._wallet_path:
             raise RuntimeError("Wallet muss zuerst gespeichert werden, bevor es gesperrt werden kann")
 
-        # Sensible Daten entfernen
+        # Sensible Daten entfernen.
+        # Hinweis: Python-Strings sind unveränderlich – das Überschreiben
+        # erzeugt nur ein neues Objekt und löscht den alten Mnemonic NICHT
+        # zuverlässig aus dem Speicher. Es entfernt lediglich die Referenz;
+        # echtes Memory-Wiping ist in reinem Python nicht möglich.
         if self._mnemonic:
             self._mnemonic = "x" * len(self._mnemonic)
         self._mnemonic = None
+        self._password = None
 
         # Sub-Wallets schließen
         if self.tron:

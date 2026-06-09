@@ -96,11 +96,12 @@ if (Test-Path $exePath) {
     Write-Host "   Starten: .\dist\DOI-Wallet-iX.exe" -ForegroundColor Cyan
     Write-Host ""
 
-    # Config kopieren falls vorhanden
-    if (Test-Path "config\config.yaml") {
+    # Beispiel-Config kopieren falls vorhanden.
+    # WICHTIG: Niemals die echte config.yaml ausliefern – sie enthaelt API-Keys/Secrets!
+    if (Test-Path "config\config.example.yaml") {
         if (-not (Test-Path "dist\config")) { New-Item -Path "dist\config" -ItemType Directory | Out-Null }
-        Copy-Item "config\config.yaml" "dist\config\" -Force
-        Write-Host "   Config kopiert → dist\config\config.yaml" -ForegroundColor Gray
+        Copy-Item "config\config.example.yaml" "dist\config\" -Force
+        Write-Host "   Beispiel-Config kopiert → dist\config\config.example.yaml" -ForegroundColor Gray
     }
 
     Write-Host "  ============================================" -ForegroundColor Green

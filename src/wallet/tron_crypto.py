@@ -11,6 +11,7 @@ Tron BIP-44 Pfad: m/44'/195'/0'/0/x
 
 import hashlib
 import struct
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
 
 from Crypto.Hash import keccak
@@ -266,50 +267,67 @@ def sign_transaction(tx_hash: bytes, private_key: bytes) -> bytes:
     Returns:
         65-Byte Signatur (r + s + v)
     """
-    from ecdsa import SigningKey, SECP256k1, util
+    from ecdsa import SigningKey, SECP256k1
     from ecdsa.util import sigencode_string
-    
+
     sk = SigningKey.from_string(private_key, curve=SECP256k1)
-    
-    # Deterministisch signieren (RFC 6979)
-    signature = sk.sign_digest(
+
+    # Deterministisch signieren (RFC 6979) – kein zufälliges k,
+    # damit schwache Zufallsquellen den Private Key nicht gefährden
+    signature = sk.sign_digest_deterministic(
         tx_hash,
+        hashfunc=hashlib.sha256,
         sigencode=sigencode_string,
     )
-    
+
     # r und s extrahieren (je 32 Bytes)
     r = int.from_bytes(signature[:32], "big")
     s = int.from_bytes(signature[32:], "big")
-    
+
+    # Low-S-Normalisierung (Schutz vor Signatur-Malleability):
+    # Bei s > n/2 wird s = n - s gesetzt; die Recovery-ID wird unten
+    # anhand der normalisierten Signatur neu bestimmt.
+    n = SECP256k1.order
+    if s > n // 2:
+        s = n - s
+
+    signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
     # Recovery ID berechnen
     vk = sk.get_verifying_key()
     pubkey = b"\x04" + vk.to_string()
-    
+
     recovery_id = _find_recovery_id(tx_hash, r, s, pubkey)
-    
+
     return signature + bytes([recovery_id])
 
 
 def _find_recovery_id(msg_hash: bytes, r: int, s: int, pubkey: bytes) -> int:
-    """Findet die Recovery-ID (0 oder 1) für eine ECDSA-Signatur."""
+    """
+    Findet die Recovery-ID (0 oder 1) für eine ECDSA-Signatur.
+
+    Raises:
+        RuntimeError: Wenn keine Recovery-ID den Public Key reproduziert
+                      (eine falsche ID würde zu einer ungültigen Signatur
+                      und damit potenziell zu Geldverlust führen).
+    """
     from ecdsa import SECP256k1, VerifyingKey
     from ecdsa.util import sigdecode_string
-    
-    try:
-        recovered_keys = VerifyingKey.from_public_key_recovery_with_digest(
-            signature=r.to_bytes(32, "big") + s.to_bytes(32, "big"),
-            digest=msg_hash,
-            curve=SECP256k1,
-            hashfunc=hashlib.sha256,
-            sigdecode=sigdecode_string
-        )
-        for i, key in enumerate(recovered_keys):
-            if b"\x04" + key.to_string() == pubkey:
-                return i
-    except Exception:
-        pass
-    
-    return 0  # Fallback
+
+    recovered_keys = VerifyingKey.from_public_key_recovery_with_digest(
+        signature=r.to_bytes(32, "big") + s.to_bytes(32, "big"),
+        digest=msg_hash,
+        curve=SECP256k1,
+        hashfunc=hashlib.sha256,
+        sigdecode=sigdecode_string
+    )
+    for i, key in enumerate(recovered_keys):
+        if b"\x04" + key.to_string() == pubkey:
+            return i
+
+    raise RuntimeError(
+        "Keine gültige Recovery-ID gefunden – Signatur passt nicht zum Public Key"
+    )
 
 
 # ──────────────────────────────────────────────
@@ -336,14 +354,6 @@ def derive_tron_address_from_seed(
     Returns:
         Tuple: (tron_address, private_key_bytes, public_key_bytes)
     """
-    # Wir verwenden den vorhandenen SeedManager für BIP-32 Ableitung
-    from .seed_manager import SeedManager
-    
-    # SeedManager mit dem Seed initialisieren
-    sm = SeedManager.__new__(SeedManager)
-    sm._seed = seed
-    sm._mnemonic = None
-    
     # BIP-32 Master-Key ableiten
     import hmac
     master_secret = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
@@ -404,11 +414,22 @@ def _ckd_priv(key: bytes, chain: bytes, index: int) -> Tuple[bytes, bytes]:
     
     I = hmac.new(chain, data, hashlib.sha512).digest()
     IL, IR = I[:32], I[32:]
-    
+
     # Neuer Key = (IL + key) mod n
     n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    child_key = ((int.from_bytes(IL, "big") + int.from_bytes(key, "big")) % n).to_bytes(32, "big")
-    
+    il_int = int.from_bytes(IL, "big")
+    child_int = (il_int + int.from_bytes(key, "big")) % n
+
+    # BIP-32 Gültigkeitsprüfung: IL >= n oder Child-Key == 0 ist ungültig
+    # (laut BIP-32 müsste dann der nächste Index verwendet werden)
+    if il_int >= n or child_int == 0:
+        raise ValueError(
+            f"Ungültiger BIP-32 Child-Key bei Index {index} – "
+            f"bitte nächsten Index verwenden"
+        )
+
+    child_key = child_int.to_bytes(32, "big")
+
     return child_key, IR
 
 
@@ -422,8 +443,13 @@ def sun_to_trx(sun: int) -> float:
 
 
 def trx_to_sun(trx: float) -> int:
-    """Konvertiert TRX in SUN."""
-    return int(trx * 1_000_000)
+    """
+    Konvertiert TRX in SUN.
+
+    Verwendet Decimal mit kaufmännischer Rundung, um Float-Abschneidefehler
+    zu vermeiden (z.B. int(19.99 * 1e6) == 19989999).
+    """
+    return int((Decimal(str(trx)) * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def raw_to_usdt(raw: int) -> float:
@@ -432,5 +458,10 @@ def raw_to_usdt(raw: int) -> float:
 
 
 def usdt_to_raw(usdt: float) -> int:
-    """Konvertiert USDT in Raw-Wert."""
-    return int(usdt * 1_000_000)
+    """
+    Konvertiert USDT in Raw-Wert.
+
+    Verwendet Decimal mit kaufmännischer Rundung, um Float-Abschneidefehler
+    zu vermeiden.
+    """
+    return int((Decimal(str(usdt)) * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))

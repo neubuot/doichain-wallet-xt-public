@@ -15,6 +15,7 @@ import argparse
 import getpass
 import os
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 # Projektroot zum Path hinzufügen
@@ -252,8 +253,10 @@ def send_doi(wm):
         return
 
     try:
-        amount = float(input("  Betrag (DOI): ").strip())
-    except ValueError:
+        # Decimal vermeidet Float-Rundungsfehler beim Parsen der Eingabe;
+        # wm.send() erwartet float → Konvertierung erst an der Schnittstelle.
+        amount = float(Decimal(input("  Betrag (DOI): ").strip()))
+    except (InvalidOperation, ValueError):
         print("  ❌ Ungültiger Betrag!")
         return
 
@@ -291,8 +294,10 @@ def send_trx(wm):
         return
 
     try:
-        amount = float(input("  Betrag (TRX): ").strip())
-    except ValueError:
+        # Decimal vermeidet Float-Rundungsfehler beim Parsen der Eingabe;
+        # wm.send() erwartet float → Konvertierung erst an der Schnittstelle.
+        amount = float(Decimal(input("  Betrag (TRX): ").strip()))
+    except (InvalidOperation, ValueError):
         print("  ❌ Ungültiger Betrag!")
         return
 
@@ -340,8 +345,10 @@ def send_usdt(wm):
         return
 
     try:
-        amount = float(input("  Betrag (USDT): ").strip())
-    except ValueError:
+        # Decimal vermeidet Float-Rundungsfehler beim Parsen der Eingabe;
+        # wm.send() erwartet float → Konvertierung erst an der Schnittstelle.
+        amount = float(Decimal(input("  Betrag (USDT): ").strip()))
+    except (InvalidOperation, ValueError):
         print("  ❌ Ungültiger Betrag!")
         return
 
