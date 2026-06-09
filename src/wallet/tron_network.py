@@ -181,39 +181,61 @@ class TronClient:
     # Low-Level API
     # ──────────────────────────────────────────
     
-    def _get(self, endpoint: str, params: dict = None, timeout: int = 15) -> dict:
+    # Bei HTTP 429 (Rate-Limit, v.a. ohne API-Key) wird mit Backoff erneut
+    # versucht. Das ist auch für broadcasttransaction sicher: Die signierte
+    # Transaktion ist idempotent (gleiche txID), ein erneuter Broadcast
+    # derselben TX kann nicht doppelt ausgeführt werden.
+    _RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+    def _request(self, method: str, endpoint: str, *, params: dict = None,
+                 data: dict = None, timeout: int = 15) -> dict:
         """
-        GET-Request an TronGrid API.
+        HTTP-Request an TronGrid API mit Retry bei Rate-Limit (429).
 
         Raises:
             ConnectionError: Bei Netzwerk- oder HTTP-Fehlern (damit Fehler
                              nicht fälschlich als Saldo 0 interpretiert werden)
         """
         url = f"{self.base_url}{endpoint}"
-        try:
-            resp = self._session.get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"TronGrid GET {endpoint} fehlgeschlagen: {e}")
-            raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+        last_error = None
+        for attempt, delay in enumerate((0.0,) + self._RETRY_DELAYS):
+            if delay:
+                logger.warning(
+                    f"TronGrid Rate-Limit (429) auf {endpoint} – "
+                    f"warte {delay:.0f}s und versuche erneut "
+                    f"({attempt}/{len(self._RETRY_DELAYS)})"
+                )
+                time.sleep(delay)
+            try:
+                if method == "GET":
+                    resp = self._session.get(url, params=params, timeout=timeout)
+                else:
+                    resp = self._session.post(url, json=data or {}, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if e.response is not None and e.response.status_code == 429:
+                    continue  # Rate-Limit → Backoff und erneut versuchen
+                logger.error(f"TronGrid {method} {endpoint} fehlgeschlagen: {e}")
+                raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+            except requests.exceptions.RequestException as e:
+                logger.error(f"TronGrid {method} {endpoint} fehlgeschlagen: {e}")
+                raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+        logger.error(f"TronGrid {method} {endpoint}: Rate-Limit trotz Retries")
+        raise ConnectionError(
+            "TronGrid Rate-Limit (429) – auch nach mehreren Versuchen. "
+            "Tipp: Kostenlosen API-Key auf trongrid.io erstellen und in "
+            "config.yaml unter tron.api_key eintragen."
+        ) from last_error
+
+    def _get(self, endpoint: str, params: dict = None, timeout: int = 15) -> dict:
+        """GET-Request an TronGrid API (mit 429-Retry, siehe _request)."""
+        return self._request("GET", endpoint, params=params, timeout=timeout)
 
     def _post(self, endpoint: str, data: dict = None, timeout: int = 15) -> dict:
-        """
-        POST-Request an TronGrid API.
-
-        Raises:
-            ConnectionError: Bei Netzwerk- oder HTTP-Fehlern (damit Fehler
-                             nicht fälschlich als Saldo 0 interpretiert werden)
-        """
-        url = f"{self.base_url}{endpoint}"
-        try:
-            resp = self._session.post(url, json=data or {}, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"TronGrid POST {endpoint} fehlgeschlagen: {e}")
-            raise ConnectionError(f"TronGrid nicht erreichbar: {e}") from e
+        """POST-Request an TronGrid API (mit 429-Retry, siehe _request)."""
+        return self._request("POST", endpoint, data=data, timeout=timeout)
     
     # ──────────────────────────────────────────
     # Netzwerk-Status
