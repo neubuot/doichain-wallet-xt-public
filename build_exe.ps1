@@ -46,11 +46,22 @@ if (Test-Path "venv\Scripts\Activate.ps1") {
 
 # ── Schritt 3: Abhängigkeiten installieren ──
 Write-Host "  [3/5] Abhängigkeiten installieren..." -ForegroundColor Yellow
-pip install --upgrade pip -q 2>$null
+# pip schreibt Hinweise auf stderr; unter $ErrorActionPreference="Stop"
+# wuerde eine stderr-Umleitung das als Fehler werten -> fuer pip lockern.
+# Ausserdem: pip.exe kann sich unter Windows nicht selbst ersetzen -> python -m pip.
+$ErrorActionPreference = "Continue"
+python -m pip install --upgrade pip --quiet --disable-pip-version-check
+$ErrorActionPreference = "Stop"
 
 # requirements.txt verwenden falls vorhanden
 if (Test-Path "requirements.txt") {
-    pip install -r requirements.txt -q
+    $ErrorActionPreference = "Continue"
+    python -m pip install -r requirements.txt --quiet --disable-pip-version-check
+    $ErrorActionPreference = "Stop"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [FEHLER] pip install -r requirements.txt fehlgeschlagen!" -ForegroundColor Red
+        exit 1
+    }
     Write-Host "        requirements.txt installiert" -ForegroundColor Green
 } else {
     # Manuell installieren
@@ -61,7 +72,13 @@ if (Test-Path "requirements.txt") {
     Write-Host "        Pakete manuell installiert" -ForegroundColor Green
 }
 
-pip install pyinstaller -q
+$ErrorActionPreference = "Continue"
+python -m pip install pyinstaller --quiet --disable-pip-version-check
+$ErrorActionPreference = "Stop"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  [FEHLER] PyInstaller-Installation fehlgeschlagen!" -ForegroundColor Red
+    exit 1
+}
 Write-Host "        PyInstaller bereit" -ForegroundColor Green
 
 # ── Schritt 4: Cache bereinigen ──
@@ -77,7 +94,7 @@ Write-Host "  [5/5] EXE erstellen..." -ForegroundColor Yellow
 Write-Host "        Das kann 2-5 Minuten dauern..." -ForegroundColor Gray
 Write-Host ""
 
-pyinstaller wallet_gui.spec --clean --noconfirm
+python -m PyInstaller wallet_gui.spec --clean --noconfirm
 
 # ── Ergebnis ──
 Write-Host ""
