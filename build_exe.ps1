@@ -1,11 +1,11 @@
-<#
+﻿<#
 .SYNOPSIS
-    DOI-Wallet-iX – Windows EXE Build-Script
+    DOI-Wallet-iX - Windows EXE Build-Script
 .DESCRIPTION
     Erstellt eine eigenständige DOI-Wallet-iX.exe für Windows.
     Installiert alle Abhängigkeiten und baut die EXE mit PyInstaller.
 .NOTES
-    © 2026 Ottmar Neuburger, WEBanizer AG – MIT License
+    © 2026 Ottmar Neuburger, WEBanizer AG - MIT License
 .EXAMPLE
     .\build_exe.ps1
 #>
@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Cyan
-Write-Host "   DOI-Wallet-iX – EXE Build" -ForegroundColor Cyan
+Write-Host "   DOI-Wallet-iX - EXE Build" -ForegroundColor Cyan
 Write-Host "  ============================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -97,11 +97,11 @@ if (Test-Path $exePath) {
     Write-Host ""
 
     # Beispiel-Config kopieren falls vorhanden.
-    # WICHTIG: Niemals die echte config.yaml ausliefern – sie enthaelt API-Keys/Secrets!
+    # WICHTIG: Niemals die echte config.yaml ausliefern - sie enthaelt API-Keys/Secrets!
     if (Test-Path "config\config.example.yaml") {
         if (-not (Test-Path "dist\config")) { New-Item -Path "dist\config" -ItemType Directory | Out-Null }
         Copy-Item "config\config.example.yaml" "dist\config\" -Force
-        Write-Host "   Beispiel-Config kopiert → dist\config\config.example.yaml" -ForegroundColor Gray
+        Write-Host "   Beispiel-Config kopiert -> dist\config\config.example.yaml" -ForegroundColor Gray
     }
 
     Write-Host "  ============================================" -ForegroundColor Green
@@ -115,9 +115,9 @@ if (Test-Path $exePath) {
     Write-Host ""
     Write-Host "  Häufige Probleme:" -ForegroundColor Yellow
     Write-Host "  - Visual C++ Build Tools fehlen (für bip-utils)" -ForegroundColor Gray
-    Write-Host "    → https://visualstudio.microsoft.com/visual-cpp-build-tools/" -ForegroundColor Gray
+    Write-Host "    -> https://visualstudio.microsoft.com/visual-cpp-build-tools/" -ForegroundColor Gray
     Write-Host "  - Antivirus blockiert PyInstaller" -ForegroundColor Gray
-    Write-Host "    → Projektordner als Ausnahme hinzufügen" -ForegroundColor Gray
+    Write-Host "    -> Projektordner als Ausnahme hinzufügen" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Debug: Mit 'pyinstaller wallet_gui.spec --clean --noconfirm --log-level DEBUG'" -ForegroundColor Gray
 }
