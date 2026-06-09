@@ -60,7 +60,7 @@ except ImportError:
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.6"
+APP_VERSION = "0.9.7"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
