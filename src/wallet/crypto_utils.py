@@ -136,6 +136,13 @@ def base58check_decode(address: str) -> tuple[int, bytes]:
 # Adress-Funktionen
 # ============================================================
 
+# Bekannte Doichain Base58Check Version-Bytes (Mainnet, Testnet).
+# Andere Version-Bytes (z.B. Bitcoin 0x00/0x05) werden NICHT akzeptiert,
+# sonst könnten Coins an Fremd-Chain-Adressen gesendet (verloren) werden.
+DOI_P2PKH_VERSIONS = (0x34, 0x6F)   # pubkey_hash: Mainnet "N"/"M", Testnet "m"/"n"
+DOI_P2SH_VERSIONS = (0x0D, 0xC4)    # script_hash: Mainnet, Testnet
+
+
 def pubkey_to_address(pubkey: bytes, version: int = 0x34) -> str:
     """
     Öffentlichen Schlüssel (komprimiert, 33 Bytes) in eine Base58Check-Adresse umwandeln.
@@ -164,36 +171,72 @@ def address_to_pubkey_hash(address: str) -> tuple[int, bytes]:
     return version, payload
 
 
-def validate_address(address: str, expected_version: Optional[int] = None,
+def _looks_like_bech32(address: str) -> bool:
+    """
+    Heuristik: Hat die Adresse Bech32-Form?
+
+    Kriterien (BIP-173): einheitliche Schreibweise, Separator "1" mit
+    mindestens 6 Checksum-Zeichen dahinter, Datenanteil nur aus dem
+    Bech32-Charset, Gesamtlänge <= 90.
+    """
+    if address.lower() != address and address.upper() != address:
+        return False  # Gemischte Schreibweise → kein gültiges Bech32
+    addr = address.lower()
+    pos = addr.rfind("1")
+    if pos < 1 or pos + 7 > len(addr) or len(addr) > 90:
+        return False
+    return all(c in BECH32_CHARSET for c in addr[pos + 1:])
+
+
+def validate_address(address: str, expected_version=None,
                      bech32_hrp: Optional[str] = None) -> bool:
     """
     Prüft ob eine Adresse gültig ist (Legacy Base58Check ODER Bech32 SegWit).
-    
+
     Args:
         address: Die zu prüfende Adresse
-        expected_version: Optionales erwartetes Version-Byte (nur für Base58Check)
-        bech32_hrp: Optionaler Bech32 Human-Readable Prefix (z.B. "dc" für Doichain)
-    
+        expected_version: Erwartetes Version-Byte (int) oder mehrere erlaubte
+            Version-Bytes (Tuple/Liste/Set) für Base58Check. Ohne Angabe werden
+            NUR die bekannten Doichain-Versionen akzeptiert – Adressen fremder
+            Chains (z.B. Bitcoin 0x00) werden abgelehnt.
+        bech32_hrp: Bech32 Human-Readable Prefix (z.B. "dc" für Doichain).
+            Bech32-Adressen werden über den Präfix "<hrp>1" erkannt –
+            der HRP wird NICHT aus der Adresse selbst geraten.
+
     Returns:
-        True wenn die Adresse gültig ist
+        True wenn die Adresse gültig (und netzwerkkonform) ist
     """
-    # Erst Bech32/SegWit prüfen (wenn HRP angegeben oder Adresse wie dc1... aussieht)
-    if bech32_hrp or (len(address) > 4 and address[2:4] == "1q"):
-        hrp = bech32_hrp or address[:2]
-        result = bech32_decode_segwit(hrp, address)
-        if result != (None, None):
-            return True
-    
-    # Dann Base58Check prüfen
+    if not address:
+        return False
+
+    # Bech32/SegWit: ausschließlich über den bekannten HRP-Präfix erkennen
+    if bech32_hrp and address.lower().startswith(bech32_hrp.lower() + "1"):
+        witver, _ = bech32_decode_segwit(bech32_hrp.lower(), address)
+        return witver is not None
+
+    # Sieht die Adresse generell wie Bech32 aus (Separator "1" + gültiger
+    # Charset), NICHT auf Base58 zurückfallen: entweder falscher/unbekannter
+    # HRP (Fremd-Chain, z.B. bc1...) oder defekte SegWit-Adresse.
+    if _looks_like_bech32(address):
+        return False
+
+    # Base58Check (Legacy P2PKH / P2SH)
     try:
         version, payload = base58check_decode(address)
-        if len(payload) != 20:
-            return False
-        if expected_version is not None and version != expected_version:
-            return False
-        return True
     except (ValueError, IndexError):
         return False
+    if len(payload) != 20:
+        return False
+
+    if expected_version is None:
+        # Ohne explizite Vorgabe: nur bekannte Doichain-Versionen,
+        # KEINE beliebigen Version-Bytes (Fremd-Chain-Schutz).
+        allowed = set(DOI_P2PKH_VERSIONS) | set(DOI_P2SH_VERSIONS)
+    elif isinstance(expected_version, int):
+        allowed = {expected_version}
+    else:
+        allowed = set(expected_version)
+    return version in allowed
 
 
 # ============================================================
@@ -392,26 +435,36 @@ def pubkey_to_segwit_address(pubkey: bytes, hrp: str = "dc") -> str:
 # Universelle Adress → scriptPubKey Konvertierung
 # ============================================================
 
-def address_to_script_pubkey(address: str, bech32_hrp: str = "dc") -> bytes:
+def address_to_script_pubkey(
+    address: str,
+    bech32_hrp: str = "dc",
+    p2pkh_versions: tuple = DOI_P2PKH_VERSIONS,
+    p2sh_versions: tuple = DOI_P2SH_VERSIONS,
+) -> bytes:
     """
     Konvertiert eine Adresse (Legacy ODER SegWit) in den entsprechenden scriptPubKey.
-    
+
     Unterstützt:
       - P2PKH (Legacy, z.B. N... / M...)  → OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
       - P2SH  (z.B. 3...)                 → OP_HASH160 <20> OP_EQUAL
       - P2WPKH (Native SegWit, dc1q..., 20 Bytes) → OP_0 <20>
       - P2WSH  (Native SegWit, dc1q..., 32 Bytes) → OP_0 <32>
       - P2TR   (Taproot, dc1p..., 32 Bytes)       → OP_1 <32>
-    
+
     Args:
         address: Jede gültige Doichain-Adresse
         bech32_hrp: Bech32 Human-Readable Part
-    
+        p2pkh_versions: Erlaubte pubkey_hash Version-Bytes
+            (default: Doichain 0x34 Mainnet / 0x6F Testnet)
+        p2sh_versions: Erlaubte script_hash Version-Bytes
+            (default: Doichain 0x0D Mainnet / 0xC4 Testnet)
+
     Returns:
         scriptPubKey als Bytes
-    
+
     Raises:
-        ValueError: Bei ungültiger Adresse
+        ValueError: Bei ungültiger Adresse oder unbekanntem Version-Byte
+            (z.B. Bitcoin-Adressen werden NICHT stillschweigend akzeptiert)
     """
     # Versuche zuerst Bech32/SegWit
     witver, witprog = bech32_decode_segwit(bech32_hrp, address)
@@ -422,29 +475,34 @@ def address_to_script_pubkey(address: str, bech32_hrp: str = "dc") -> bytes:
         else:
             op_ver = 0x50 + witver  # OP_1..OP_16
         return bytes([op_ver, len(witprog)]) + witprog
-    
+
     # Base58Check (Legacy P2PKH oder P2SH)
     try:
         version, payload = base58check_decode(address)
     except ValueError as e:
         raise ValueError(f"Ungültige Adresse '{address}': {e}")
-    
+
     if len(payload) != 20:
         raise ValueError(f"Ungültige Payload-Länge: {len(payload)}")
-    
+
     # P2PKH: pubkey_hash Version-Byte (0x34 Mainnet, 0x6F Testnet)
-    if version in (0x34, 0x6F, 0x00):
+    if version in p2pkh_versions:
         # OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         return bytes([0x76, 0xA9, 0x14]) + payload + bytes([0x88, 0xAC])
-    
+
     # P2SH: script_hash Version-Byte (0x0D Mainnet, 0xC4 Testnet)
-    elif version in (0x0D, 0xC4, 0x05):
+    elif version in p2sh_versions:
         # OP_HASH160 <20 bytes> OP_EQUAL
         return bytes([0xA9, 0x14]) + payload + bytes([0x87])
-    
+
     else:
-        # Unbekanntes Version-Byte → behandle als P2PKH
-        return bytes([0x76, 0xA9, 0x14]) + payload + bytes([0x88, 0xAC])
+        # Unbekanntes Version-Byte → ablehnen statt raten. Eine als P2PKH
+        # interpretierte Fremd-Chain-Adresse (z.B. Bitcoin 0x00) würde
+        # sonst zu unwiederbringlich verlorenen Coins führen.
+        raise ValueError(
+            f"Unbekanntes Adress-Version-Byte 0x{version:02X} für '{address}' – "
+            f"Adresse gehört nicht zum Doichain-Netzwerk"
+        )
 
 
 # ============================================================

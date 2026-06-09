@@ -20,9 +20,10 @@ v0.9.5-Robustheitsfixes:
     und die neue Change-Adresse invalidiert.
   * Fehler bei Saldo-/UTXO-Abfragen werden propagiert (nicht mehr stumm
     als 0 verbucht).
-  * send() ruft am Ende einen leichten incremental scan, damit die neue
-    Change-Adresse für Folgeabfragen sicher bekannt ist und _change_index
-    selbstheilend mitwächst.
+  * send() registriert die neue Change-Adresse direkt in _known_addresses
+    und aktualisiert nur die Caches der betroffenen Adressen – KEIN voller
+    GAP_LIMIT-Scan mehr pro Send (discover_addresses() bleibt für
+    connect()/explizite Aufrufe verfügbar).
   * get_state()/set_state() ermöglichen Persistenz der Indizes über
     Wallet-Neustarts hinweg (via separater state-Datei im wallet_manager).
 """
@@ -486,6 +487,25 @@ class DoiWallet:
             self._balance_cache.pop(a, None)
             self._utxo_cache.pop(a, None)
 
+    def _refresh_addresses(self, addresses):
+        """
+        Aktualisiert Saldo- und UTXO-Cache gezielt für einzelne Adressen.
+
+        Deutlich günstiger als eine volle Discovery (kein GAP_LIMIT-Scan,
+        nur zwei Abfragen pro betroffener Adresse). Fehler sind hier nicht
+        kritisch: der Cache-Eintrag bleibt dann einfach leer und wird bei
+        der nächsten Abfrage nachgeladen.
+        """
+        for addr in addresses:
+            try:
+                self._balance_cache[addr] = self.electrum.get_balance(addr)
+                self._utxo_cache[addr] = self.electrum.get_utxos(addr)
+            except (ConnectionError, RuntimeError) as e:
+                logger.warning(
+                    "Cache-Refresh für %s fehlgeschlagen (nicht kritisch): %s",
+                    addr, e,
+                )
+
     # ========================================================
     # Senden
     # ========================================================
@@ -500,9 +520,19 @@ class DoiWallet:
         """Sendet DOI an eine Empfängeradresse."""
         self._ensure_connected()
 
-        # Adresse validieren (Legacy P2PKH, P2SH und SegWit Bech32)
-        if not validate_address(recipient, bech32_hrp=self.network.get("bech32_hrp", "dc")):
-            raise ValueError(f"Ungültige Empfängeradresse: {recipient}")
+        # Adresse validieren (Legacy P2PKH, P2SH und SegWit Bech32).
+        # WICHTIG: expected_version auf die Doichain-Versionen einschränken,
+        # damit Bitcoin-/Fremd-Chain-Adressen abgelehnt werden (sonst wären
+        # die Coins unwiederbringlich verloren).
+        allowed_versions = (self.network["pubkey_hash"], self.network["script_hash"])
+        if not validate_address(
+            recipient,
+            expected_version=allowed_versions,
+            bech32_hrp=self.network.get("bech32_hrp", "dc"),
+        ):
+            raise ValueError(
+                f"Ungültige oder netzwerkfremde Empfängeradresse: {recipient}"
+            )
 
         # Betrag umrechnen
         amount_sat = doi_to_satoshi(amount_doi)
@@ -573,17 +603,17 @@ class DoiWallet:
         # Nach erfolgreichem Broadcast:
         # 1) Stale Caches für verbrauchte UTXO-Adressen + neue Change-Adresse
         #    invalidieren, damit die nächste Saldo-Anzeige stimmt.
-        # 2) Leichten Inkrement-Scan fahren: prüft, ob die soeben benutzte
-        #    Change-Adresse bereits indexiert ist und ob es weitere
-        #    unbekannte Change-Adressen gibt.
+        # 2) Nur die betroffenen Adressen gezielt neu abfragen. Die neue
+        #    Change-Adresse ist bereits via get_new_change_address() in
+        #    _known_addresses registriert – ein voller GAP_LIMIT-Scan
+        #    (discover_addresses, viele Netzwerk-Roundtrips) ist hier
+        #    unnötig und bleibt expliziten Aufrufen bzw. connect()
+        #    vorbehalten.
         # ──────────────────────────────────────────
         spent_addresses = {u.address for u in utxos}
-        self._invalidate_caches_for(spent_addresses | {change_address})
-
-        try:
-            self.discover_addresses()
-        except Exception as e:
-            logger.warning("Re-Discovery nach Send fehlgeschlagen (nicht kritisch): %s", e)
+        affected = spent_addresses | {change_address}
+        self._invalidate_caches_for(affected)
+        self._refresh_addresses(affected)
 
         return result
 

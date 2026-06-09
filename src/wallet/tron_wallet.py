@@ -205,6 +205,16 @@ class TronWallet:
             if info["address"] == address:
                 return info["privkey"]
         return None
+
+    @staticmethod
+    def _to_hex_address(address: str) -> str:
+        """Konvertiert eine Tron-Adresse (Base58Check oder Hex) in Hex (41...)."""
+        if address.startswith("41") and len(address) == 42:
+            return address.lower()
+        hex_addr = tron_address_to_hex(address)
+        if not hex_addr:
+            raise ValueError(f"Kann Adresse nicht konvertieren: {address}")
+        return hex_addr
     
     # ──────────────────────────────────────────
     # Saldo-Abfragen
@@ -329,7 +339,10 @@ class TronWallet:
         
         Raises:
             ValueError: Bei ungültiger Adresse oder unzureichendem Saldo
-            RuntimeError: Wenn Wallet nicht initialisiert
+            RuntimeError: Wenn Wallet nicht initialisiert, die Transaktion
+                          nicht verifiziert werden kann oder der Broadcast
+                          fehlschlägt
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
         """
         from_addr = from_address or self.primary_address
         if not from_addr:
@@ -361,13 +374,21 @@ class TronWallet:
         unsigned_tx = self.client.create_trx_transfer(from_addr, to_address, amount_sun)
         if not unsigned_tx:
             raise RuntimeError("Konnte Transaktion nicht erstellen")
-        
-        # Signieren und senden
-        result = self.client.sign_and_broadcast(unsigned_tx, privkey)
-        
-        if result and "error" not in result:
-            logger.info(f"TRX gesendet: {amount_trx} TRX → {to_address}")
-        
+
+        # Signieren und senden – mit Verifizierung, dass die vom Server
+        # gelieferte Transaktion exakt der Anforderung entspricht
+        result = self.client.sign_and_broadcast(
+            unsigned_tx,
+            privkey,
+            expected={
+                "type": "TransferContract",
+                "owner_address": self._to_hex_address(from_addr),
+                "to_address": self._to_hex_address(to_address),
+                "amount": amount_sun,
+            },
+        )
+
+        logger.info(f"TRX gesendet: {amount_trx} TRX → {to_address}")
         return result
     
     # ──────────────────────────────────────────
@@ -385,16 +406,23 @@ class TronWallet:
         Sendet USDT (TRC-20) an eine Adresse.
         
         WICHTIG: Für TRC-20 Transfers werden TRX als Gas benötigt!
-        Typisch: 5–15 TRX pro USDT-Transfer.
+        Ohne gestakte Energie typisch ~13–30 TRX pro USDT-Transfer.
         
         Args:
             to_address: Empfänger-Adresse
             amount_usdt: Betrag in USDT
             from_address: Absender-Adresse (default: primäre Adresse)
             fee_limit_trx: Maximale Fee in TRX (default: 100)
-        
+
         Returns:
             Ergebnis mit txID
+
+        Raises:
+            ValueError: Bei ungültiger Adresse oder unzureichendem Saldo
+            RuntimeError: Wenn Wallet nicht initialisiert, die Transaktion
+                          nicht verifiziert werden kann oder der Broadcast
+                          fehlschlägt
+            ConnectionError: Wenn TronGrid nicht erreichbar ist
         """
         from_addr = from_address or self.primary_address
         if not from_addr:
@@ -418,12 +446,16 @@ class TronWallet:
             )
         
         # TRX-Saldo für Gas prüfen
+        # Ohne gestakte Energie kostet ein USDT-Transfer real ca. 13–30 TRX,
+        # daher konservativ 30 TRX als Mindestreserve verlangen
         trx_balance = self.client.get_trx_balance(from_addr)
-        min_trx_for_gas = trx_to_sun(5.0)  # Mindestens 5 TRX für Gas
+        min_trx_for_gas = trx_to_sun(30.0)
         if trx_balance < min_trx_for_gas:
             raise ValueError(
-                f"Unzureichender TRX-Saldo für Gas: {sun_to_trx(trx_balance):.6f} TRX "
-                f"(mindestens ~5 TRX nötig für TRC-20 Transfer)"
+                f"Unzureichender TRX-Saldo für Gas: {sun_to_trx(trx_balance):.6f} TRX. "
+                f"Ein USDT-Transfer (TRC-20) kostet ohne gestakte Energie "
+                f"typischerweise ~13–30 TRX an Energie/Bandbreite – "
+                f"bitte mindestens 30 TRX auf der Absender-Adresse bereithalten."
             )
         
         # Private Key finden
@@ -438,13 +470,22 @@ class TronWallet:
         )
         if not unsigned_tx:
             raise RuntimeError("Konnte USDT-Transaktion nicht erstellen")
-        
-        # Signieren und senden
-        result = self.client.sign_and_broadcast(unsigned_tx, privkey)
-        
-        if result and "error" not in result:
-            logger.info(f"USDT gesendet: {amount_usdt} USDT → {to_address}")
-        
+
+        # Signieren und senden – mit Verifizierung, dass die vom Server
+        # gelieferte Transaktion exakt der Anforderung entspricht
+        result = self.client.sign_and_broadcast(
+            unsigned_tx,
+            privkey,
+            expected={
+                "type": "TriggerSmartContract",
+                "owner_address": self._to_hex_address(from_addr),
+                "contract_address": self._to_hex_address(self.network["usdt_contract"]),
+                "to_address": self._to_hex_address(to_address),
+                "amount": amount_raw,
+            },
+        )
+
+        logger.info(f"USDT gesendet: {amount_usdt} USDT → {to_address}")
         return result
     
     # ──────────────────────────────────────────

@@ -190,30 +190,22 @@ class EthWallet:
             raise RuntimeError("web3/eth-account nicht installiert: pip install web3 eth-account")
 
         path = f"m/44'/60'/0'/0/{account_index}"
-        # Manuelle Seed-Ableitung (umgeht mnemonic-Wortlisten-Problem in EXE)
+
+        # HD-Wallet-Features sicherstellen (idempotent; normalerweise
+        # bereits beim Modul-Import aktiviert)
+        Account.enable_unaudited_hdwallet_features()
+
+        # WICHTIG: Kein manueller BIP-32-Fallback! Ein früherer Fallback
+        # hat bei beliebigen Fehlern (z.B. ungültiger Mnemonic) FALSCHE
+        # Adressen abgeleitet – dorthin gesendete Coins wären verloren.
+        # Fehler werden stattdessen mit klarer Meldung weitergereicht.
         try:
             acct = Account.from_mnemonic(mnemonic, account_path=path)
-        except Exception:
-            from mnemonic import Mnemonic
-            from hashlib import pbkdf2_hmac
-            import hmac, hashlib, struct
-            seed = pbkdf2_hmac("sha512", mnemonic.encode("utf-8"), b"mnemonic", 2048)
-            # BIP-32 Master Key
-            I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
-            key, chain = I[:32], I[32:]
-            # BIP-44 Ableitung: m/44'/60'/0'/0/index
-            for idx in [0x8000002C, 0x8000003C, 0x80000000, 0, account_index]:
-                if idx >= 0x80000000:
-                    data = b"\x00" + key + struct.pack(">I", idx)
-                else:
-                    from eth_keys import keys
-                    pk = keys.PrivateKey(key)
-                    data = pk.public_key.to_compressed_bytes() + struct.pack(">I", idx)
-                I = hmac.new(chain, data, hashlib.sha512).digest()
-                child_key = (int.from_bytes(I[:32], "big") + int.from_bytes(key, "big")) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-                key = child_key.to_bytes(32, "big")
-                chain = I[32:]
-            acct = Account.from_key(key)
+        except Exception as e:
+            raise ValueError(
+                f"ETH-Adressableitung fehlgeschlagen – Mnemonic ungültig "
+                f"oder eth-account-Fehler: {e}"
+            ) from e
 
         self._private_key = acct.key.hex()
         if self._private_key.startswith("0x"):
@@ -408,7 +400,9 @@ class EthWallet:
                 f"Vorhanden: {wei_to_eth(balance):.6f} ETH"
             )
 
-        nonce = self._w3.eth.get_transaction_count(from_addr)
+        # "pending" berücksichtigt noch nicht bestätigte Transaktionen,
+        # damit aufeinanderfolgende Sends nicht denselben Nonce verwenden
+        nonce = self._w3.eth.get_transaction_count(from_addr, "pending")
         tx = {
             "nonce": nonce,
             "to": to_addr,
@@ -487,7 +481,9 @@ class EthWallet:
                 f"Vorhanden: {wei_to_eth(eth_balance):.6f} ETH"
             )
 
-        nonce = self._w3.eth.get_transaction_count(from_addr)
+        # "pending" berücksichtigt noch nicht bestätigte Transaktionen,
+        # damit aufeinanderfolgende Sends nicht denselben Nonce verwenden
+        nonce = self._w3.eth.get_transaction_count(from_addr, "pending")
         tx = contract.functions.transfer(to_addr, raw_amount).build_transaction({
             "from": from_addr,
             "nonce": nonce,

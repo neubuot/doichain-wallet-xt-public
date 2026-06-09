@@ -206,9 +206,12 @@ class SeedManager:
             data = parent_pubkey + struct.pack(">I", index)
 
         h = hmac.new(parent_chain_code, data, hashlib.sha512).digest()
-        child_key_int = (int.from_bytes(h[:32], "big") + int.from_bytes(parent_key, "big")) % SECP256K1_ORDER
+        il_int = int.from_bytes(h[:32], "big")
+        child_key_int = (il_int + int.from_bytes(parent_key, "big")) % SECP256K1_ORDER
 
-        if child_key_int == 0:
+        # BIP-32: IL >= n oder ki == 0 → Schlüssel ungültig,
+        # der Index muss übersprungen werden (extrem unwahrscheinlich)
+        if il_int >= SECP256K1_ORDER or child_key_int == 0:
             raise ValueError("Ungültiger Kind-Schlüssel (extrem unwahrscheinlich)")
 
         child_key = child_key_int.to_bytes(32, "big")
@@ -229,13 +232,22 @@ class SeedManager:
         if self._master_key is None:
             raise RuntimeError("SeedManager nicht initialisiert. Zuerst from_mnemonic() aufrufen.")
 
-        parts = path.replace("m/", "").split("/")
+        parts = path.strip().split("/")
+        if not parts or parts[0] != "m":
+            raise ValueError(f"Ungültiger BIP-32 Pfad: {path!r} (muss mit 'm' beginnen)")
+
         key = self._master_key
         chain_code = self._master_chain_code
 
-        for part in parts:
+        # Pfad "m" alleine → Master-Schlüssel zurückgeben
+        for part in parts[1:]:
             hardened = part.endswith("'") or part.endswith("h")
-            index = int(part.rstrip("'h"))
+            index_str = part[:-1] if hardened else part
+            if not index_str.isdigit():
+                raise ValueError(f"Ungültige Pfad-Komponente: {part!r} in {path!r}")
+            index = int(index_str)
+            if not 0 <= index < 2**31:
+                raise ValueError(f"Index außerhalb des gültigen Bereichs (0..2^31-1): {part!r}")
             key, chain_code = self._derive_child(key, chain_code, index, hardened)
 
         return key, chain_code

@@ -37,11 +37,32 @@ import hmac
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+import urllib.parse
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Akzeptierte Eingabetypen für Preise/Mengen
+Amount = Union[float, str, Decimal]
+
+
+def _format_amount(value: Amount) -> str:
+    """
+    Konvertiert float/str/Decimal verlustarm in einen API-String.
+
+    Vermeidet Float-Artefakte wie "0.30000000000000004" und
+    Exponenten-Notation wie "1e-05" (XT.com erwartet Dezimalschreibweise).
+    """
+    try:
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(f"Ungültiger Zahlenwert: {value!r}")
+    if not d.is_finite():
+        raise ValueError(f"Ungültiger Zahlenwert: {value!r}")
+    return format(d, "f")  # keine Exponenten-Notation
 
 # ──────────────────────────────────────────────
 # Konstanten
@@ -88,7 +109,26 @@ class XTClient:
     # HTTP Helpers
     # ──────────────────────────────────────────
 
-    def _sign(self, method: str, path: str, params: dict = None, body: str = "") -> dict:
+    @staticmethod
+    def _build_query(params: dict = None) -> str:
+        """
+        Baut den Query-String, der sowohl signiert als auch gesendet wird.
+
+        Wichtig: Signatur und Request müssen byte-identisch sein, deshalb
+        wird der String genau einmal hier erzeugt (URL-encodiert, sortiert)
+        und anschließend unverändert an die URL angehängt.
+        Booleans werden zu "true"/"false" normalisiert (nicht Python "True").
+        """
+        if not params:
+            return ""
+        normalized = []
+        for key, value in sorted(params.items()):
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            normalized.append((key, str(value)))
+        return urllib.parse.urlencode(normalized)
+
+    def _sign(self, method: str, path: str, query: str = "", body: str = "") -> dict:
         """
         Erstellt die XT.com v4 Signatur-Header.
 
@@ -97,16 +137,14 @@ class XTClient:
             Y = #METHOD#path[#query][#body]
             original = X + Y
             signature = HmacSHA256(secret, original)
+
+        Args:
+            query: Fertiger Query-String aus _build_query() – wird exakt
+                   so signiert, wie er gesendet wird.
         """
         timestamp = str(int(time.time() * 1000))
         recvwindow = "60000"
-
-        # Query-String sortiert
-        if params:
-            sorted_params = sorted(params.items())
-            query_string = "&".join(f"{k}={v}" for k, v in sorted_params)
-        else:
-            query_string = ""
+        query_string = query or ""
 
         # X: Header-Paare alphabetisch sortiert
         header_params = {
@@ -140,6 +178,25 @@ class XTClient:
             "validate-signature": signature,
         }
 
+    @staticmethod
+    def _raise_http_error(path: str, e: requests.exceptions.HTTPError):
+        """
+        Wandelt einen HTTPError in eine aussagekräftige Exception um.
+
+        Der Response-Body (auf ~300 Zeichen gekürzt) wird mitgegeben,
+        damit die XT.com Fehlermeldung nicht verloren geht.
+        HTTP 429 wird als Rate-Limit gesondert ausgewiesen.
+        """
+        resp = e.response
+        status = resp.status_code if resp is not None else "?"
+        body = (resp.text or "").strip()[:300] if resp is not None else ""
+        if status == 429:
+            raise ConnectionError(
+                f"XT.com Rate-Limit erreicht (HTTP 429) bei {path} – "
+                f"bitte Anfragen drosseln. Antwort: {body}"
+            )
+        raise ConnectionError(f"XT.com HTTP-Fehler {status} bei {path}: {body}")
+
     def _public_get(self, path: str, params: dict = None) -> dict:
         """Öffentlicher GET-Request."""
         url = f"{self.base_url}{path}"
@@ -148,8 +205,12 @@ class XTClient:
             resp.raise_for_status()
             data = resp.json()
             if data.get("rc") != 0:
-                logger.warning(f"XT.com API-Fehler: {data.get('mc', 'Unbekannt')}")
+                # Fehler hart melden statt leere Daten (z.B. Preis 0.0) weiterzugeben
+                raise RuntimeError(f"XT.com API-Fehler: {data.get('mc', 'Unbekannt')}")
             return data
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"XT.com GET {path}: {e}")
+            self._raise_http_error(path, e)
         except requests.exceptions.RequestException as e:
             logger.error(f"XT.com GET {path}: {e}")
             raise ConnectionError(f"XT.com API nicht erreichbar: {e}")
@@ -157,12 +218,19 @@ class XTClient:
     def _private_get(self, path: str, params: dict = None) -> dict:
         """Authentifizierter GET-Request."""
         self._require_auth()
-        headers = self._sign("GET", path, params=params)
+        # Query-String einmal bauen: identisch signieren und senden
+        query = self._build_query(params)
+        headers = self._sign("GET", path, query=query)
         url = f"{self.base_url}{path}"
+        if query:
+            url += f"?{query}"
         try:
-            resp = self.session.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
+            resp = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
             return resp.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"XT.com private GET {path}: {e}")
+            self._raise_http_error(path, e)
         except requests.exceptions.RequestException as e:
             logger.error(f"XT.com private GET {path}: {e}")
             raise ConnectionError(f"XT.com API nicht erreichbar: {e}")
@@ -177,6 +245,9 @@ class XTClient:
             resp = self.session.post(url, data=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
             return resp.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"XT.com private POST {path}: {e}")
+            self._raise_http_error(path, e)
         except requests.exceptions.RequestException as e:
             logger.error(f"XT.com private POST {path}: {e}")
             raise ConnectionError(f"XT.com API nicht erreichbar: {e}")
@@ -184,12 +255,19 @@ class XTClient:
     def _private_delete(self, path: str, params: dict = None) -> dict:
         """Authentifizierter DELETE-Request."""
         self._require_auth()
-        headers = self._sign("DELETE", path, params=params)
+        # Query-String einmal bauen: identisch signieren und senden
+        query = self._build_query(params)
+        headers = self._sign("DELETE", path, query=query)
         url = f"{self.base_url}{path}"
+        if query:
+            url += f"?{query}"
         try:
-            resp = self.session.delete(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
+            resp = self.session.delete(url, headers=headers, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
             return resp.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"XT.com private DELETE {path}: {e}")
+            self._raise_http_error(path, e)
         except requests.exceptions.RequestException as e:
             logger.error(f"XT.com private DELETE {path}: {e}")
             raise ConnectionError(f"XT.com API nicht erreichbar: {e}")
@@ -367,6 +445,13 @@ class XTClient:
         levels = ob["asks"] if side == "BUY" else ob["bids"]
         base_price = ob["best_ask"] if side == "BUY" else ob["best_bid"]
 
+        if not levels:
+            # Leeres Orderbuch: Fehler melden statt vwap=0 zurückzugeben
+            raise RuntimeError(
+                f"Orderbuch für {symbol or self.symbol} ist leer ({side}-Seite) – "
+                f"VWAP kann nicht berechnet werden."
+            )
+
         total_cost = 0.0
         total_filled = 0.0
         fills = []
@@ -386,7 +471,13 @@ class XTClient:
             total_cost += fill_cost
             total_filled += fill_qty
 
-        vwap = total_cost / total_filled if total_filled > 0 else 0
+        if total_filled <= 0:
+            raise RuntimeError(
+                f"Keine Liquidität im Orderbuch für {symbol or self.symbol} ({side}) – "
+                f"VWAP kann nicht berechnet werden."
+            )
+
+        vwap = total_cost / total_filled
         slippage = ((vwap - base_price) / base_price * 100) if base_price else 0
 
         return {
@@ -407,8 +498,12 @@ class XTClient:
         """
         Alle Kontosalden.
 
+        Hinweis: Beträge werden als Decimal zurückgegeben (verlustfrei,
+        z.B. für Order-Mengen). Decimal verhält sich bei Vergleichen und
+        Formatierung (f"{x:.6f}") wie float.
+
         Returns:
-            [{"currency": str, "available": float, "frozen": float, "total": float}, ...]
+            [{"currency": str, "available": Decimal, "frozen": Decimal, "total": Decimal}, ...]
         """
         data = self._private_get("/v4/balances")
         if data.get("rc") != 0:
@@ -421,15 +516,22 @@ class XTClient:
         if not isinstance(assets, list):
             assets = []
 
+        def _dec(value) -> Decimal:
+            """API-Betrag verlustfrei in Decimal wandeln."""
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError, TypeError):
+                return Decimal(0)
+
         return [
             {
                 "currency": a.get("currency", "").upper(),
-                "available": float(a.get("availableAmount", 0)),
-                "frozen": float(a.get("frozenAmount", 0)),
-                "total": float(a.get("totalAmount", 0)),
+                "available": _dec(a.get("availableAmount", 0)),
+                "frozen": _dec(a.get("frozenAmount", 0)),
+                "total": _dec(a.get("totalAmount", 0)),
             }
             for a in assets
-            if float(a.get("totalAmount", 0)) > 0
+            if _dec(a.get("totalAmount", 0)) > 0
         ]
 
     def get_balance(self, currency: str) -> dict:
@@ -437,11 +539,16 @@ class XTClient:
         Saldo einer bestimmten Währung.
 
         Returns:
-            {"currency": str, "available": float, "frozen": float}
+            {"currency": str, "available": Decimal, "frozen": Decimal}
         """
         balances = self.get_balances()
         bal = next((b for b in balances if b["currency"] == currency.upper()), None)
-        return bal or {"currency": currency.upper(), "available": 0, "frozen": 0, "total": 0}
+        return bal or {
+            "currency": currency.upper(),
+            "available": Decimal(0),
+            "frozen": Decimal(0),
+            "total": Decimal(0),
+        }
 
     # ──────────────────────────────────────────
     # Private Endpoints – Orders
@@ -450,8 +557,8 @@ class XTClient:
     def place_limit_order(
         self,
         side: str,
-        price: float,
-        quantity: float,
+        price: Amount,
+        quantity: Amount,
         symbol: str = None,
     ) -> dict:
         """
@@ -459,8 +566,8 @@ class XTClient:
 
         Args:
             side: "BUY" oder "SELL"
-            price: Limit-Preis in USDT
-            quantity: Menge DOI
+            price: Limit-Preis in USDT (float, str oder Decimal)
+            quantity: Menge DOI (float, str oder Decimal)
             symbol: Trading-Paar (default: doi_usdt)
 
         Returns:
@@ -473,8 +580,9 @@ class XTClient:
             "type": "LIMIT",
             "timeInForce": "GTC",  # Good Till Cancelled
             "bizType": "SPOT",
-            "price": str(price),
-            "quantity": str(quantity),
+            # Decimal-basiert formatieren: keine Float-Artefakte, kein Exponent
+            "price": _format_amount(price),
+            "quantity": _format_amount(quantity),
         }
 
         data = self._private_post("/v4/order", order_data)
@@ -496,8 +604,8 @@ class XTClient:
     def place_market_order(
         self,
         side: str,
-        quantity: float = None,
-        quote_quantity: float = None,
+        quantity: Amount = None,
+        quote_quantity: Amount = None,
         symbol: str = None,
     ) -> dict:
         """
@@ -505,8 +613,9 @@ class XTClient:
 
         Args:
             side: "BUY" oder "SELL"
-            quantity: Menge DOI (für SELL, oder BUY nach Menge)
-            quote_quantity: USDT-Betrag (für BUY nach Wert)
+            quantity: Menge DOI (nur für SELL)
+            quote_quantity: USDT-Betrag (Pflicht für BUY – XT.com Spot
+                            akzeptiert bei MARKET-BUY nur quoteQty)
             symbol: Trading-Paar
 
         Returns:
@@ -520,10 +629,17 @@ class XTClient:
             "bizType": "SPOT",
         }
 
-        if side.upper() == "BUY" and quote_quantity:
-            order_data["quoteQty"] = str(quote_quantity)
+        if side.upper() == "BUY":
+            if not quote_quantity:
+                # XT.com Spot lehnt MARKET-BUY mit quantity ab –
+                # früh und verständlich fehlschlagen statt ungültige Order zu senden
+                raise ValueError(
+                    "MARKET-BUY benötigt quote_quantity (USDT-Betrag). "
+                    "XT.com akzeptiert bei Market-Käufen nur quoteQty, keine Stückzahl."
+                )
+            order_data["quoteQty"] = _format_amount(quote_quantity)
         elif quantity:
-            order_data["quantity"] = str(quantity)
+            order_data["quantity"] = _format_amount(quantity)
         else:
             raise ValueError("quantity oder quote_quantity muss angegeben werden")
 
