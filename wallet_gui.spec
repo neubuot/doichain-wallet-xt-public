@@ -43,6 +43,14 @@ import os as _os
 _mnpath = _os.path.join(_os.path.dirname(_mn.__file__), 'wordlist')
 datas.append((_mnpath, 'mnemonic/wordlist'))
 
+# eth_account braucht seine eigene BIP-39-Wortliste
+# (eth_account/hdaccount/wordlist/english.txt) fuer Account.from_mnemonic().
+# Ohne sie schlaegt die ETH-Wallet-Initialisierung im Frozen-Build fehl.
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+datas += collect_data_files('eth_account')
+datas += collect_data_files('eth_utils')
+datas += collect_data_files('eth_typing')
+
 # ── Hidden Imports ──
 # PyInstaller erkennt nicht alle dynamischen Imports
 hiddenimports = [
@@ -62,9 +70,11 @@ hiddenimports = [
     # Web3 / Ethereum
     'web3', 'web3.auto', 'web3.middleware',
     'web3.providers', 'web3.providers.rpc',
-    'eth_account', 'eth_abi', 'eth_abi.abi',
+    'eth_abi', 'eth_abi.abi',
     'eth_utils', 'eth_typing', 'eth_keys', 'eth_rlp',
     'eth_hash', 'eth_hash.auto',
+    'eth_keyfile', 'rlp', 'hexbytes', 'bitarray',
+    'parsimonious', 'regex', 'pydantic',
     'cytoolz', 'toolz', 'toolz.itertoolz', 'toolz.functoolz',
     'pyunormalize',
 
@@ -77,6 +87,9 @@ hiddenimports = [
 
     # Konfiguration
     'yaml',
+
+    # eth_account vollstaendig (inkl. hdaccount-Submodule fuer from_mnemonic)
+    *collect_submodules('eth_account'),
 
     # Interne Module
     'src', 'src.wallet', 'src.exchange',
