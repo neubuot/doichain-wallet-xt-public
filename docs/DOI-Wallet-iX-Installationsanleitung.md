@@ -1,6 +1,6 @@
 # DOI-Wallet-iX – Installationsanleitung
 
-**Version 0.9.7 (Beta)**
+**Version 0.9.8 (Beta)**
 
 Schritt für Schritt für Einsteiger
 
@@ -21,6 +21,14 @@ empfangen und versenden:
 | USDT (Tether) | Ein Stablecoin, der an den US-Dollar gekoppelt ist |
 | ETH (Ethereum) | Die zweitgrößte Kryptowährung der Welt |
 | wDOI (Wrapped DOI) | DOI als Token auf der Ethereum-Blockchain |
+
+**Neu in v0.9.8:**
+
+- Export aller Transaktionen je Wallet und Währung als CSV oder Excel
+  (Transaktions-Seite, Button „⬇ Export")
+- Fehler „Language not detected" beim Öffnen weiterer Wallets behoben
+- Salden werden nach Netzwerkfehlern nicht mehr fälschlich als 0 angezeigt,
+  Transaktionslisten laden bis zu 200 Einträge und melden unvollständige Abrufe
 
 **Highlights in v0.9.7:**
 

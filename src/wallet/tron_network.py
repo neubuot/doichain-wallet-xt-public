@@ -382,54 +382,87 @@ class TronClient:
     # Transaktions-History
     # ──────────────────────────────────────────
     
-    def get_transactions(self, address: str, limit: int = 20, only_confirmed: bool = True) -> List[dict]:
+    # Sicherheitsgrenzen fuer die Pagination (TronGrid: max. 200 je Seite)
+    PAGE_SIZE = 200
+    MAX_TOTAL = 5000
+
+    def _get_paged(self, endpoint: str, params: dict, limit: Optional[int]) -> List[dict]:
+        """
+        Holt eine TronGrid-Liste seitenweise (v0.9.8).
+
+        TronGrid liefert je Antwort maximal 200 Eintraege und in
+        meta.fingerprint einen Cursor fuer die naechste Seite. Vorher wurde
+        nur die erste Seite (20 Eintraege) geladen, dadurch fehlten in der
+        Transaktionsliste aeltere Buchungen.
+
+        Args:
+            endpoint: API-Pfad
+            params: Basis-Parameter (ohne limit/fingerprint)
+            limit: Maximale Gesamtzahl. None = alle (gedeckelt auf MAX_TOTAL).
+
+        Returns:
+            Liste der Eintraege (neueste zuerst, wie von TronGrid geliefert)
+        """
+        max_total = self.MAX_TOTAL if limit is None else max(1, min(limit, self.MAX_TOTAL))
+        items: List[dict] = []
+        fingerprint: Optional[str] = None
+        max_pages = (max_total + self.PAGE_SIZE - 1) // self.PAGE_SIZE + 1
+
+        for _ in range(max_pages):
+            page_params = dict(params)
+            page_params["limit"] = min(self.PAGE_SIZE, max_total - len(items))
+            if fingerprint:
+                page_params["fingerprint"] = fingerprint
+            data = self._get(endpoint, page_params)
+            page = data.get("data", []) if isinstance(data, dict) else []
+            if not page:
+                break
+            items.extend(page)
+            if len(items) >= max_total:
+                break
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            fingerprint = meta.get("fingerprint") if isinstance(meta, dict) else None
+            if not fingerprint:
+                break
+
+        return items[:max_total]
+
+    def get_transactions(self, address: str, limit: Optional[int] = 20,
+                         only_confirmed: bool = True) -> List[dict]:
         """
         Gibt die Transaktions-History einer Adresse zurück.
-        
+
         Args:
             address: Tron-Adresse
-            limit: Maximale Anzahl (default: 20)
+            limit: Maximale Anzahl (default: 20). None = alle Seiten
+                   (gedeckelt auf MAX_TOTAL).
             only_confirmed: Nur bestätigte Transaktionen
-        
+
         Returns:
             Liste von Transaktions-Daten
         """
-        params = {
-            "limit": min(limit, 200),
-            "only_confirmed": only_confirmed,
-        }
-        
-        data = self._get(f"/v1/accounts/{address}/transactions", params)
-        if data and "data" in data:
-            return data["data"]
-        return []
-    
-    def get_trc20_transactions(self, address: str, contract: str = None, limit: int = 20) -> List[dict]:
+        params = {"only_confirmed": only_confirmed}
+        return self._get_paged(f"/v1/accounts/{address}/transactions", params, limit)
+
+    def get_trc20_transactions(self, address: str, contract: str = None,
+                               limit: Optional[int] = 20) -> List[dict]:
         """
         Gibt TRC-20 Token-Transaktionen zurück.
-        
+
         Args:
             address: Tron-Adresse
             contract: Contract-Adresse (default: USDT)
-            limit: Maximale Anzahl
-        
+            limit: Maximale Anzahl. None = alle Seiten (gedeckelt auf MAX_TOTAL).
+
         Returns:
             Liste von TRC-20 Transaktions-Daten
         """
         if contract is None:
             contract = self.network["usdt_contract"]
-        
-        params = {
-            "limit": min(limit, 200),
-            "only_confirmed": True,
-            "contract_address": contract,
-        }
-        
-        data = self._get(f"/v1/accounts/{address}/transactions/trc20", params)
-        if data and "data" in data:
-            return data["data"]
-        return []
-    
+
+        params = {"only_confirmed": True, "contract_address": contract}
+        return self._get_paged(f"/v1/accounts/{address}/transactions/trc20", params, limit)
+
     # ──────────────────────────────────────────
     # TRX Transfer
     # ──────────────────────────────────────────

@@ -74,6 +74,8 @@ class DoiWallet:
         self._known_addresses: dict[str, dict] = {}  # address → keypair info
         self._utxo_cache: dict[str, list] = {}        # address → UTXOs
         self._balance_cache: dict[str, dict] = {}     # address → balance
+        self.last_history_complete: bool = True       # v0.9.8: siehe get_history()
+        self.last_history_errors: int = 0
         self._last_discover_iso: Optional[str] = None
 
     # ========================================================
@@ -369,22 +371,34 @@ class DoiWallet:
 
         total_confirmed = 0
         total_unconfirmed = 0
-        stale_addresses: list[str] = []
+        stale_addresses: list[str] = []      # Abfrage fehlgeschlagen, Cache-Wert verwendet
+        unknown_addresses: list[str] = []    # Abfrage fehlgeschlagen, kein Cache-Wert
+        aborted = False
 
         for address in list(self._known_addresses):
             need_query = force_refresh or address not in self._balance_cache
-            if need_query:
+            if need_query and not aborted:
                 try:
                     self._balance_cache[address] = self.electrum.get_balance(address)
                 except (ConnectionError, RuntimeError) as e:
-                    # WICHTIG: Fehler nicht als 0 werten, sondern als
-                    # "unbekannt" markieren. Aufrufer kann das anzeigen.
+                    # WICHTIG: Fehler nicht als 0 werten. v0.9.8: statt die
+                    # Adresse komplett aus der Summe zu werfen, wird der letzte
+                    # bekannte Cache-Wert weiterverwendet und die Adresse als
+                    # "stale" gemeldet. Vorher zeigte das Dashboard nach einem
+                    # Verbindungsabbruch 0 DOI, obwohl der Saldo bekannt war.
                     logger.warning("Saldo-Abfrage für %s fehlgeschlagen: %s", address, e)
                     stale_addresses.append(address)
-                    continue
+                    # Verbindung weg? Dann nicht fuer jede weitere Adresse
+                    # in den Reconnect-Timeout laufen (bis zu 10 s je Adresse).
+                    if not self.electrum or not self.electrum.is_connected:
+                        aborted = True
+            elif need_query and aborted:
+                stale_addresses.append(address)
 
             bal = self._balance_cache.get(address)
-            if not bal:
+            if bal is None:
+                if address in stale_addresses:
+                    unknown_addresses.append(address)
                 continue
             total_confirmed += bal.get("confirmed", 0)
             total_unconfirmed += bal.get("unconfirmed", 0)
@@ -398,6 +412,9 @@ class DoiWallet:
             "unconfirmed_doi": satoshi_to_doi(total_unconfirmed),
             "total_doi": satoshi_to_doi(total),
             "stale_addresses": stale_addresses,
+            "unknown_addresses": unknown_addresses,
+            # True nur, wenn jede Adresse frisch beantwortet wurde
+            "complete": not stale_addresses,
         }
 
     def get_address_balance(self, address: str) -> dict:
@@ -625,12 +642,19 @@ class DoiWallet:
         """Gibt die Transaktionshistorie aller Adressen zurück."""
         self._ensure_connected()
         all_txs: dict[str, dict] = {}
+        errors = 0
 
         for address in list(self._known_addresses):
             try:
                 history = self.electrum.get_history(address)
             except (ConnectionError, RuntimeError) as e:
                 logger.warning("History-Abfrage für %s fehlgeschlagen: %s", address, e)
+                errors += 1
+                if not self.electrum or not self.electrum.is_connected:
+                    # Verbindung weg: Rest ueberspringen, Ergebnis ist
+                    # ohnehin unvollstaendig (siehe last_history_complete).
+                    errors += max(0, len(self._known_addresses) - len(all_txs) - 1)
+                    break
                 continue
 
             for entry in history:
@@ -644,6 +668,11 @@ class DoiWallet:
                 else:
                     all_txs[tx_hash]["addresses"].append(address)
 
+        # v0.9.8: Aufrufer (GUI, Export) koennen erkennen, ob Adressen
+        # wegen Netzwerkfehlern fehlen, statt eine Teilliste als komplett
+        # anzuzeigen.
+        self.last_history_complete = (errors == 0)
+        self.last_history_errors = errors
         return sorted(all_txs.values(), key=lambda t: t["height"], reverse=True)
 
     # ========================================================

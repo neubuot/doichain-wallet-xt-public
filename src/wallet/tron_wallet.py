@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 
 from mnemonic import Mnemonic
 
+from .bip39_wordlist import get_mnemonic
+
 from .tron_crypto import (
     derive_tron_address_from_seed,
     validate_tron_address,
@@ -91,7 +93,7 @@ class TronWallet:
         Returns:
             Mnemonic Seed-Phrase (SICHER AUFBEWAHREN!)
         """
-        mnemo = Mnemonic("english")
+        mnemo = get_mnemonic()
         self._mnemonic = mnemo.generate(strength)
         self._seed = mnemo.to_seed(self._mnemonic, passphrase)
         
@@ -112,7 +114,7 @@ class TronWallet:
         Returns:
             Primäre Tron-Adresse
         """
-        mnemo = Mnemonic("english")
+        mnemo = get_mnemonic()
         if not mnemo.check(mnemonic):
             raise ValueError("Ungültige Seed-Phrase!")
         
@@ -492,14 +494,14 @@ class TronWallet:
     # Transaktions-History
     # ──────────────────────────────────────────
     
-    def get_history(self, address: str = None, limit: int = 20) -> List[dict]:
+    def get_history(self, address: str = None, limit: Optional[int] = 20) -> List[dict]:
         """Gibt die TRX-Transaktions-History zurück."""
         addr = address or self.primary_address
         if not addr:
             raise RuntimeError("Wallet nicht initialisiert")
         return self.client.get_transactions(addr, limit)
     
-    def get_usdt_history(self, address: str = None, limit: int = 20) -> List[dict]:
+    def get_usdt_history(self, address: str = None, limit: Optional[int] = 20) -> List[dict]:
         """Gibt die USDT-Transaktions-History zurück."""
         addr = address or self.primary_address
         if not addr:

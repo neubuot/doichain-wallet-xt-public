@@ -48,6 +48,7 @@ from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import scrypt
 from mnemonic import Mnemonic
 
+from .bip39_wordlist import get_mnemonic
 from .doi_wallet import DoiWallet
 from .tron_wallet import TronWallet
 from .tron_network import TRON_MAINNET, TRON_NILE_TESTNET
@@ -261,7 +262,7 @@ class WalletManager:
         if len(password) < 8:
             raise ValueError("Passwort muss mindestens 8 Zeichen lang sein")
 
-        mnemo = Mnemonic("english")
+        mnemo = get_mnemonic()
         self._mnemonic = mnemo.generate(strength)
         self._password = password
         self._settings["created"] = datetime.now(timezone.utc).isoformat()
@@ -287,7 +288,7 @@ class WalletManager:
         if len(password) < 8:
             raise ValueError("Passwort muss mindestens 8 Zeichen lang sein")
 
-        mnemo = Mnemonic("english")
+        mnemo = get_mnemonic()
         if not mnemo.check(mnemonic):
             raise ValueError("Ungültige Seed-Phrase!")
 
@@ -332,7 +333,9 @@ class WalletManager:
                 self.eth.connect()
                 logger.info(f"ETH-Wallet initialisiert: {self.eth.address}")
             except Exception as e:
-                logger.warning(f"ETH-Wallet Fehler: {e}")
+                # Nur Typ + Kurztext loggen: Fremdbibliotheken (eth_account)
+                # koennen im Fehlertext die Seed-Woerter mitliefern.
+                logger.warning("ETH-Wallet Fehler: %s", type(e).__name__)
                 self.eth = None
         else:
             logger.info("ETH-Support nicht verfügbar (web3 nicht installiert)")

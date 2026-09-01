@@ -37,3 +37,8 @@ config/config.local.yaml
 
 # Lokale Wallet-Konfiguration (Keys!)
 config/config.yaml
+dist-archiv/
+*.state.json
+tab_config.json
+daily_sends.json
+tx_notes.json

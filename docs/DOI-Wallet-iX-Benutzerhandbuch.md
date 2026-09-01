@@ -1,6 +1,6 @@
 # DOI-Wallet-iX – Benutzerhandbuch
 
-**Version 0.9.7 (Beta)**
+**Version 0.9.8 (Beta)**
 
 Multi-Chain Desktop Wallet für DOI, TRX, USDT, ETH und wDOI mit XT.com
 Exchange-Integration, Multi-Wallet-Tabs, Transaktions-Notizen, Tageslimit und
@@ -126,6 +126,13 @@ Bestehende `wallet.dat` wird automatisch als Wallet-1 erkannt.
 Zeigt alle Salden (DOI, TRX, USDT, ETH, wDOI), Adressen, Portfolio-Wert in
 USDT und Verbindungsstatus. „Aktualisieren" lädt alle Daten neu.
 
+**Saldo-Status (seit v0.9.8):** Konnte ein Saldo nicht vollständig abgerufen
+werden, zeigt das Dashboard das nicht mehr als „0" an. Stattdessen erscheint
+der letzte bekannte Stand mit dem Zeichen ⚠ (gelb) oder „–", falls noch nie
+ein Wert geladen werden konnte, dazu eine gelbe Hinweiszeile unter den
+Karten (zum Beispiel „DOI: letzter bekannter Stand"). In diesem Fall
+Netzwerk prüfen und „Aktualisieren" drücken.
+
 Die Transaktionsliste aktualisiert sich automatisch alle 60 Sekunden, solange
 die Transaktions-Seite geöffnet ist (seit v0.9.6).
 
@@ -186,6 +193,11 @@ Adressen bleiben dauerhaft gültig.
 Die Transaktionshistorie zeigt alle ein- und ausgehenden Transaktionen.
 Filter-Tabs: Alle, DOI, TRX, USDT, ETH, wDOI.
 
+Seit v0.9.8 werden je Währung bis zu 200 Einträge geladen (vorher 20, dadurch
+fehlten ältere Buchungen). Schlägt der Abruf einer Chain fehl, erscheint oben
+ein gelber Hinweis „Liste unvollständig" statt einer stillschweigend gekürzten
+Liste. Die vollständige Historie liefert der Export (Abschnitt 8.4).
+
 ### 8.1 Bestätigungen
 
 Jede Transaktion zeigt den Bestätigungs-Status: Anzahl Bestätigungen oder
@@ -203,6 +215,39 @@ nach einem Neustart erhalten (gespeichert in `tx_notes.json`).
 
 Klick auf den (gekürzten) Transaktions-Hash kopiert die vollständige TX-ID in
 die Zwischenablage (seit v0.9.6) – praktisch für Block-Explorer.
+
+### 8.4 Export als CSV oder Excel (seit v0.9.8)
+
+Der Button „⬇ Export" oben rechts auf der Transaktions-Seite exportiert die
+Transaktionen je Wallet und je Währung, zum Beispiel für die Buchhaltung.
+
+Im Dialog wählen Sie:
+
+- **Wallets:** ein oder mehrere geladene Wallet-Tabs (vorausgewählt ist der
+  aktive Tab, „Alle" wählt alle geladenen Wallets).
+- **Währungen:** DOI, TRX, USDT, ETH, wDOI (beliebig kombinierbar).
+- **Format:** CSV (Semikolon-getrennt, Dezimalkomma, UTF-8 mit BOM, öffnet
+  sich in deutschem Excel per Doppelklick) oder Excel-Arbeitsmappe (.xlsx).
+- **Umfang:** „Alle Transaktionen vollständig neu laden" lädt die komplette
+  Historie aller Seiten (empfohlen, dauert je nach Wallet länger). Ohne
+  Haken wird die zuletzt angezeigte Liste exportiert (maximal 200 Einträge je
+  Währung).
+
+Ergebnis:
+
+- **CSV:** je Wallet und Währung eine Datei
+  `Transaktionen_<Wallet>_<Währung>_<Datum>.csv` im gewählten Ordner, bei
+  mehreren Wallets oder Währungen zusätzlich `Transaktionen_Alle-Wallets_Gesamt_<Datum>.csv`.
+- **Excel:** eine Arbeitsmappe mit einem Blatt je Wallet und Währung plus
+  einem Blatt „Gesamt".
+
+Spalten: Datum, Zeit, Wallet, Währung, Richtung (Eingang/Ausgang), Betrag,
+Betrag_signiert (Ausgänge negativ), Von, An, Block, Status
+(Bestätigt/Unbestätigt), TX-Hash, Notiz (Ihre Transaktions-Notiz).
+
+Hinweis: Transaktionen, deren Betrag nicht ermittelt werden konnte, erscheinen
+mit Richtung „Unbekannt" und Betrag 0. Ist der Abruf einer Chain
+fehlgeschlagen, meldet das Ergebnisfenster „unvollständig".
 
 ---
 
@@ -283,7 +328,9 @@ durch echte Entschlüsselung der Wallet-Datei verifiziert (seit v0.9.7).
 | Problem | Lösung |
 |---------|--------|
 | Wallet startet nicht | Keine andere Instanz laufen lassen. |
-| Salden zeigen 0 | „Aktualisieren" klicken. Verbindungs-Indikatoren prüfen. Diagnose-Button nutzen. Seit v0.9.7 wird bei Netzwerkfehlern eine Fehlermeldung statt fälschlich „0" angezeigt. |
+| Salden zeigen 0 | „Aktualisieren" klicken. Verbindungs-Indikatoren prüfen. Diagnose-Button nutzen. Seit v0.9.8 bleibt bei Netzwerkfehlern der letzte bekannte Saldo mit ⚠ stehen, und eine gelbe Hinweiszeile nennt die betroffene Währung. |
+| „Wallet-Fehler: Language not detected" | Betraf v0.9.7 und älter: Die EXE entpackt sich in einen temporären Ordner, den Windows (Speicheroptimierung, Datenträgerbereinigung) oder ein Virenscanner bei tagelang laufender App aufräumen kann. Danach fehlt die BIP-39-Wortliste, und weitere Wallets lassen sich nicht öffnen. Sofortlösung: Wallet beenden und neu starten. Seit v0.9.8 ist die Wortliste fest in das Programm eingebettet, der Fehler kann nicht mehr auftreten. |
+| Salden oder Transaktionen fehlen nur bei manchen Tabs | Bei vielen gleichzeitig geladenen Wallets bricht der ElectrumX-Server einzelne Abfragen ab. Seit v0.9.8 wird das als ⚠ bzw. „Liste unvollständig" angezeigt. „Aktualisieren" bzw. 🔄 im jeweiligen Tab wiederholt den Abruf. |
 | ETH zeigt ✕ | Internetverbindung prüfen. ETH benötigt RPC-Verbindung. Bei älteren EXE-Builds: auf v0.9.7 aktualisieren (Bundling-Fehler behoben). |
 | „429 Too Many Requests" (Tron) | TronGrid-Rate-Limit. Das Wallet versucht es automatisch erneut. Dauerhaft: kostenlosen API-Key auf trongrid.io erstellen und unter Einstellungen eintragen. |
 | „❌ Falsches Passwort!" beim Senden | Das Wallet-Passwort wurde falsch eingegeben (wird seit v0.9.7 wirklich geprüft). |
@@ -296,6 +343,31 @@ durch echte Entschlüsselung der Wallet-Datei verifiziert (seit v0.9.7).
 ---
 
 ## 13. Changelog
+
+### v0.9.8 – Anzeige-Fixes und Export
+
+- **NEU: Export der Transaktionen** je Wallet und Währung als CSV
+  (Excel-kompatibel) oder Excel-Arbeitsmappe, wahlweise mit vollständigem
+  Nachladen aller Seiten (Abschnitt 8.4)
+- **FIX „Language not detected":** BIP-39-Wortliste fest eingebettet, keine
+  Abhängigkeit mehr vom temporären Entpackordner der EXE. Betraf das Öffnen
+  weiterer Wallets bei länger laufender Anwendung.
+- **FIX Saldo-Anzeige:** Nach einem Netzwerkfehler wurde 0 statt des bekannten
+  Saldos angezeigt (Dashboard 0 DOI, Info-Dialog korrekter Wert). Jetzt bleibt
+  der letzte bekannte Stand mit ⚠ stehen, nie geladene Werte zeigen „–", und
+  eine Hinweiszeile nennt die betroffene Währung. Bei Verbindungsverlust wird
+  nicht mehr für jede Adresse einzeln in den Timeout gelaufen.
+- **FIX Transaktionsliste:** TRX, USDT und wDOI luden nur 20 Einträge (jetzt
+  200, Export: alle). Fehlgeschlagene Abrufe werden als „Liste unvollständig"
+  gekennzeichnet statt eine gekürzte Liste als komplett zu zeigen.
+- **SICHERHEIT:** ETH-Adressableitung nutzt die eingebettete Wortliste und
+  eth-accounts BIP-32-Ableitung direkt (Ergebnis bitidentisch, per
+  Testvektor abgesichert). Fehlermeldungen von eth-account, die die Seed-Wörter
+  im Klartext enthalten konnten, gelangen nicht mehr in Dialoge oder Logs.
+- CA-Zertifikatsbündel wird beim Start in `%LOCALAPPDATA%\DOI-Wallet-iX`
+  gesichert, damit HTTPS-Abfragen auch nach einer Temp-Bereinigung
+  funktionieren; Info-Dialog zeigt einen Ressourcen-Check.
+- Neue Regressionstests (`tests/test_v098.py`, 16 Tests)
 
 ### v0.9.7 – Security- und Bugfix-Release
 
