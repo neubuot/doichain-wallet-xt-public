@@ -101,6 +101,10 @@ hiddenimports = [
     'src.wallet.eth_wallet',
     'src.wallet.eth_network',
     'src.exchange.xt_client',
+    # v0.9.8
+    'src.wallet.bip39_wordlist',
+    'src.utils.tx_export',
+    'openpyxl', 'et_xmlfile',
 ]
 
 a = Analysis(

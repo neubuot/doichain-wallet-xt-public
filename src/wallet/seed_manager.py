@@ -15,6 +15,8 @@ from typing import Optional
 
 from mnemonic import Mnemonic
 
+from .bip39_wordlist import get_mnemonic
+
 from .crypto_utils import (
     hash160,
     pubkey_to_address,
@@ -121,7 +123,7 @@ class SeedManager:
 
     def __init__(self, network: Optional[dict] = None):
         self.network = network or MAINNET
-        self.mnemo = Mnemonic("english")
+        self.mnemo = get_mnemonic()
         self._master_key: Optional[bytes] = None
         self._master_chain_code: Optional[bytes] = None
         self._mnemonic: Optional[str] = None
@@ -137,14 +139,12 @@ class SeedManager:
         Returns:
             Seed-Phrase als String
         """
-        mnemo = Mnemonic("english")
-        return mnemo.generate(strength)
+        return get_mnemonic().generate(strength)
 
     @staticmethod
     def validate_mnemonic(mnemonic: str) -> bool:
         """Prüft ob eine Mnemonic-Phrase gültig ist."""
-        mnemo = Mnemonic("english")
-        return mnemo.check(mnemonic)
+        return get_mnemonic().check(mnemonic)
 
     def from_mnemonic(self, mnemonic: str, passphrase: str = "") -> "SeedManager":
         """

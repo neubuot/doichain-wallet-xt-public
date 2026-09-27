@@ -18,6 +18,20 @@
 ```
 
 Das Script installiert alle Abhängigkeiten und erstellt `dist\DOI-Wallet-iX.exe`.
+Für die Weitergabe die Datei mit Versionsnummer umbenennen
+(z. B. `DOI-Wallet-iX-0-9-8.exe`), damit Anwender alte und neue Builds
+unterscheiden können.
+
+**Hinweis Onefile-Build (seit v0.9.8 dokumentiert):** Die EXE entpackt sich
+beim Start nach `%TEMP%\_MEIxxxxxx`. Läuft das Wallet tagelang, kann Windows
+(Speicheroptimierung, Datenträgerbereinigung) oder ein Virenscanner diesen
+Ordner leeren. Alles, was das Programm erst zur Laufzeit von dort nachlädt,
+fehlt dann. Seit v0.9.8 sind die kritischen Ressourcen deshalb eingebettet
+(BIP-39-Wortliste) bzw. werden beim Start nach `%LOCALAPPDATA%\DOI-Wallet-iX`
+kopiert (CA-Zertifikate). Neue Laufzeit-Ressourcen bitte nach demselben
+Muster behandeln oder auf einen Onedir-Build (`runtime_tmpdir`/`COLLECT`)
+umstellen. Der Info-Dialog zeigt unter „Ressourcen", ob Temp-Ordner und
+CA-Bundle noch vorhanden sind.
 
 
 ## EXE erstellen (Manuell)

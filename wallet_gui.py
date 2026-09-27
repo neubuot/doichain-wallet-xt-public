@@ -54,13 +54,61 @@ try:
 except ImportError:
     XTClient = None
 
+from src.utils import tx_export
+from src.wallet.bip39_wordlist import verify_wordlist as _verify_wordlist
+
+
+def ensure_persistent_ca_bundle() -> Optional[str]:
+    """
+    v0.9.8: CA-Zertifikatsbundel (certifi) aus dem fluechtigen PyInstaller-
+    Temp-Verzeichnis in einen dauerhaften Ordner kopieren.
+
+    Hintergrund: Im Onefile-Build liegt cacert.pem unter %TEMP%\\_MEIxxxxxx.
+    Wird dieser Ordner waehrend einer laengeren Laufzeit bereinigt, schlagen
+    alle HTTPS-Aufrufe (TronGrid, Blockscout, XT.com) fehl. Ziel:
+    %LOCALAPPDATA%\\DOI-Wallet-iX\\cacert.pem. requests/urllib3 lesen den
+    Pfad aus REQUESTS_CA_BUNDLE bzw. SSL_CERT_FILE.
+
+    Returns: Pfad des verwendeten Bundles oder None (dann Standardverhalten).
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        import shutil
+        import certifi
+        src = certifi.where()
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        target_dir = Path(base) / APP_NAME
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "cacert.pem"
+        if (not target.exists()) or target.stat().st_size != os.path.getsize(src):
+            shutil.copyfile(src, target)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", str(target))
+        os.environ.setdefault("SSL_CERT_FILE", str(target))
+        return str(target)
+    except Exception as e:  # nicht kritisch
+        logger.warning("CA-Bundle konnte nicht persistiert werden: %s", e)
+        return None
+
+
+def _ca_bundle_path() -> Optional[str]:
+    """Bevorzugt das persistierte Bundle (siehe ensure_persistent_ca_bundle)."""
+    env = os.environ.get("REQUESTS_CA_BUNDLE")
+    if env and os.path.exists(env):
+        return env
+    try:
+        import certifi
+        return certifi.where()
+    except ImportError:
+        return None
+
 
 # ──────────────────────────────────────────────
 # Konfiguration
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.9.8"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
@@ -501,6 +549,9 @@ class WalletApp(ctk.CTk):
         self.wm: Optional[WalletManager] = None
         self.xt: Optional[XTClient] = None
         self._balances = {"doi": 0, "trx": 0, "usdt": 0, "eth": 0, "wdoi": 0}
+        # v0.9.8: Status je Waehrung ("ok" | "stale" | "error" | "unknown"),
+        # damit ein fehlgeschlagener Abruf nicht als "0" erscheint.
+        self._bal_status = {}
         self._doi_connected = False
         self._price_doi = 0.0
 
@@ -512,6 +563,7 @@ class WalletApp(ctk.CTk):
                 "wm": None,
                 "xt": None,
                 "balances": {"doi": 0, "trx": 0, "usdt": 0, "eth": 0, "wdoi": 0},
+                "bal_status": {},
                 "doi_connected": False,
                 "price_doi": 0.0,
                 "dat_file": None,
@@ -541,6 +593,7 @@ class WalletApp(ctk.CTk):
         # self.after() mehr aufrufen; laufende Sends werden abgefragt.
         self._closing = False
         self._send_in_progress = False
+        self._export_running = False   # v0.9.8: Export laeuft (Worker-Thread)
 
         # Verzoegerter Einzelklick auf Wallet-Tabs (Doppelklick = Umbenennen)
         self._tab_click_after_id = None
@@ -835,6 +888,7 @@ class WalletApp(ctk.CTk):
         slot["wm"] = self.wm
         slot["xt"] = self.xt
         slot["balances"] = self._balances.copy()
+        slot["bal_status"] = dict(self._bal_status)
         slot["doi_connected"] = self._doi_connected
         slot["price_doi"] = self._price_doi
         slot["hist_data"] = self._hist_data.copy() if self._hist_data else {}
@@ -845,6 +899,7 @@ class WalletApp(ctk.CTk):
         self.wm = slot["wm"]
         self.xt = slot["xt"]
         self._balances = slot["balances"].copy()
+        self._bal_status = dict(slot.get("bal_status", {}))
         self._doi_connected = slot["doi_connected"]
         self._price_doi = slot["price_doi"]
         self._hist_data = slot.get("hist_data", {}).copy()
@@ -907,6 +962,7 @@ class WalletApp(ctk.CTk):
         slot["dat_file"] = dat_file
         slot["loaded"] = True
         slot["balances"] = {"doi": 0, "trx": 0, "usdt": 0, "eth": 0, "wdoi": 0}
+        slot["bal_status"] = {}
         slot["doi_connected"] = False
         slot["price_doi"] = 0.0
 
@@ -1235,6 +1291,14 @@ class WalletApp(ctk.CTk):
         self._usdt_card = self._make_balance_card(cards, "USDT", "0.00", COLOR_USDT, 0, 2)
         self._eth_card = self._make_balance_card(cards, "ETH", "0.000000", COLOR_ETH, 1, 0)
         self._wdoi_card = self._make_balance_card(cards, "wDOI", "0.0000", COLOR_WDOI, 1, 1)
+
+        # v0.9.8: Hinweis, wenn Salden nicht (vollstaendig) abgerufen werden konnten
+        self._bal_warn_label = ctk.CTkLabel(
+            page, text="",
+            font=ctk.CTkFont(size=12),
+            text_color=COLOR_WARNING, anchor="w", wraplength=760, justify="left",
+        )
+        self._bal_warn_label.pack(fill="x", padx=5, pady=(2, 0))
 
         # Adressen
         addr_frame = ctk.CTkFrame(page, fg_color=COLOR_CARD, corner_radius=10)
@@ -1593,6 +1657,15 @@ class WalletApp(ctk.CTk):
             command=self._refresh_history_async,
         ).pack(side="right")
 
+        # v0.9.8: Export (CSV / Excel) je Wallet und Waehrung
+        ctk.CTkButton(
+            header, text="⬇  Export", width=100, height=35,
+            font=ctk.CTkFont(size=13),
+            fg_color=COLOR_CARD, hover_color="#2a3a5c",
+            border_width=1, border_color=COLOR_ACCENT,
+            command=self._open_export_dialog,
+        ).pack(side="right", padx=(0, 8))
+
         # Chain-Filter
         self._hist_filter = ctk.CTkSegmentedButton(
             page,
@@ -1683,107 +1756,13 @@ class WalletApp(ctk.CTk):
             self._safe_after(0, _finish)
             return
 
-        data = {}
+        def _status_cb(text):
+            def _upd(text=text):
+                if _still_current():
+                    self._update_hist_status(text)
+            self._safe_after(0, _upd)
 
-        # ETH + wDOI Transaktionen (RPC-basiert)
-        if wm.eth:
-            # wDOI-History (Event Logs – funktioniert)
-            try:
-                data["wdoi"] = wm.eth.get_wdoi_history(limit=20)
-                logger.debug(f"wDOI-History: {len(data['wdoi'])} TXs")
-                if data["wdoi"]:
-                    logger.debug(f"wDOI TX[0]: {data['wdoi'][0]}")
-            except Exception as e:
-                logger.debug(f"wDOI-History Error: {e}")
-                data["wdoi"] = []
-
-            # ETH-History: Rekonstruiere aus wDOI-TXs + Etherscan
-            try:
-                data["eth"] = self._load_eth_history_rpc(wm, data.get("wdoi", []))
-                logger.debug(f"ETH-History (RPC): {len(data['eth'])} TXs")
-            except Exception as e:
-                logger.debug(f"ETH-History Error: {e}", exc_info=True)
-                data["eth"] = []
-
-        # DOI-Transaktionen (mit Beträgen via ElectrumX TX-Lookup)
-        if wm.doi:
-            try:
-                doi_hist = wm.doi.get_history()
-                logger.debug(f"DOI raw history type: {type(doi_hist).__name__}")
-                if isinstance(doi_hist, list):
-                    logger.debug(f"DOI raw history: {len(doi_hist)} TXs")
-                    if doi_hist:
-                        logger.debug(f"DOI TX[0] keys: {list(doi_hist[0].keys()) if isinstance(doi_hist[0], dict) else 'not a dict'}")
-                    # Status-Update im UI (nur falls Slot/Generation noch aktuell)
-                    def _status(n=len(doi_hist)):
-                        if _still_current():
-                            self._update_hist_status(f"⏳ Lade DOI-Beträge ({n} TXs)...")
-                    self._safe_after(0, _status)
-                    data["doi"] = self._enrich_doi_history(wm, doi_hist)
-                elif isinstance(doi_hist, dict):
-                    logger.debug(f"DOI raw history keys: {list(doi_hist.keys())}")
-                    for key in ["transactions", "txs", "history", "data"]:
-                        if key in doi_hist and isinstance(doi_hist[key], list):
-                            logger.debug(f"DOI raw: using dict['{key}'] with {len(doi_hist[key])} TXs")
-                            data["doi"] = self._enrich_doi_history(wm, doi_hist[key])
-                            break
-                    else:
-                        data["doi"] = []
-                else:
-                    data["doi"] = []
-                # v0.9.6.6: Reconcile - falls Enrich TXs schluckt, Platzhalter anlegen
-                if isinstance(doi_hist, list) and isinstance(data.get("doi"), list):
-                    _enriched_hashes = {_e.get("hash", "") for _e in data["doi"] if isinstance(_e, dict)}
-                    for _raw in doi_hist:
-                        if not isinstance(_raw, dict):
-                            continue
-                        _rh = _raw.get("tx_hash", "")
-                        if _rh and _rh not in _enriched_hashes:
-                            data["doi"].append({
-                                "hash": _rh,
-                                "direction": "unknown",
-                                "value": 0,
-                                "symbol": "DOI",
-                                "timestamp": 0,
-                                "from": "",
-                                "to": "",
-                                "block": _raw.get("height", 0),
-                            })
-
-                logger.debug(f"DOI-History: {len(data.get('doi',[]))} TXs (enriched)")
-            except Exception as e:
-                logger.debug(f"DOI-History Error: {e}", exc_info=True)
-                data["doi"] = []
-
-        # Tron-Transaktionen
-        if wm.tron:
-            try:
-                trx_hist = wm.tron.get_history(limit=20)
-                logger.debug(f"TRX-History Typ: {type(trx_hist).__name__}")
-                if isinstance(trx_hist, list):
-                    data["trx"] = trx_hist
-                    if trx_hist:
-                        logger.debug(f"TRX TX[0]: {trx_hist[0]}")
-                elif isinstance(trx_hist, dict) and "data" in trx_hist:
-                    data["trx"] = trx_hist["data"]
-                else:
-                    data["trx"] = []
-            except Exception as e:
-                logger.debug(f"TRX-History Error: {e}")
-                data["trx"] = []
-
-            try:
-                usdt_hist = wm.tron.get_usdt_history(limit=20)
-                logger.debug(f"USDT-History Typ: {type(usdt_hist).__name__}")
-                if isinstance(usdt_hist, list):
-                    data["usdt"] = usdt_hist
-                elif isinstance(usdt_hist, dict) and "data" in usdt_hist:
-                    data["usdt"] = usdt_hist["data"]
-                else:
-                    data["usdt"] = []
-            except Exception as e:
-                logger.debug(f"USDT-History Error: {e}")
-                data["usdt"] = []
+        data = self._fetch_history_data(wm, full=False, status_cb=_status_cb)
 
         # Ergebnis in den Slot-eigenen Speicher schreiben; UI nur aktualisieren,
         # wenn dieser Slot noch aktiv und die Generation noch aktuell ist.
@@ -1798,7 +1777,134 @@ class WalletApp(ctk.CTk):
 
         self._safe_after(0, _apply)
 
-    def _load_eth_history_rpc(self, wm, wdoi_txs: list = None) -> list:
+    # Anzeige-Limits (v0.9.8: 200 statt 20 – TronGrid liefert je Seite bis zu
+    # 200; bei 20 fehlten aeltere Buchungen bzw. TRX-Transfers, wenn die
+    # letzten 20 Konto-Eintraege USDT-Transfers waren). Export: alle Seiten.
+    HISTORY_DISPLAY_LIMIT = 200
+
+    def _fetch_history_data(self, wm, full: bool = False, status_cb=None) -> dict:
+        """
+        Laedt die Transaktionen aller Chains fuer ein Wallet (Worker-Thread).
+
+        Args:
+            wm: WalletManager des Slots (eingefroren beim Thread-Start)
+            full: True = alle Seiten laden (Export), False = Anzeige-Limit
+            status_cb: optionaler Callback(text) fuer Fortschrittsmeldungen
+
+        Returns:
+            {chain: [tx, ...], "_incomplete": [chain, ...]}
+            "_incomplete" listet Chains, deren Abruf Fehler hatte, damit die
+            GUI eine Teilliste nicht als vollstaendig ausgibt.
+        """
+        limit = None if full else self.HISTORY_DISPLAY_LIMIT
+        data = {}
+        incomplete = []
+
+        def _say(text):
+            if status_cb:
+                try:
+                    status_cb(text)
+                except Exception:
+                    pass
+
+        # ETH + wDOI Transaktionen (RPC-basiert)
+        if wm.eth:
+            _say("⏳ Lade wDOI-Transaktionen...")
+            try:
+                data["wdoi"] = wm.eth.get_wdoi_history(limit=limit)
+                logger.debug(f"wDOI-History: {len(data['wdoi'])} TXs")
+            except Exception as e:
+                logger.debug(f"wDOI-History Error: {e}")
+                data["wdoi"] = []
+                incomplete.append("wDOI")
+
+            _say("⏳ Lade ETH-Transaktionen...")
+            try:
+                data["eth"] = self._load_eth_history_rpc(wm, data.get("wdoi", []), full=full)
+                logger.debug(f"ETH-History (RPC): {len(data['eth'])} TXs")
+            except Exception as e:
+                logger.debug(f"ETH-History Error: {e}", exc_info=True)
+                data["eth"] = []
+                incomplete.append("ETH")
+
+        # DOI-Transaktionen (mit Betraegen via ElectrumX TX-Lookup)
+        if wm.doi:
+            _say("⏳ Lade DOI-Transaktionen...")
+            try:
+                doi_hist = wm.doi.get_history()
+                if not getattr(wm.doi, "last_history_complete", True):
+                    incomplete.append("DOI")
+                raw_list = []
+                if isinstance(doi_hist, list):
+                    raw_list = doi_hist
+                elif isinstance(doi_hist, dict):
+                    for key in ["transactions", "txs", "history", "data"]:
+                        if key in doi_hist and isinstance(doi_hist[key], list):
+                            raw_list = doi_hist[key]
+                            break
+                logger.debug(f"DOI raw history: {len(raw_list)} TXs")
+                _say(f"⏳ Lade DOI-Beträge ({len(raw_list)} TXs)...")
+                max_txs = None if full else 200
+                data["doi"] = self._enrich_doi_history(wm, raw_list, max_txs=max_txs)
+
+                # v0.9.6.6: Reconcile - falls Enrich TXs schluckt, Platzhalter anlegen
+                if isinstance(data.get("doi"), list):
+                    _enriched_hashes = {_e.get("hash", "") for _e in data["doi"] if isinstance(_e, dict)}
+                    for _raw in raw_list:
+                        if not isinstance(_raw, dict):
+                            continue
+                        _rh = _raw.get("tx_hash", "")
+                        if _rh and _rh not in _enriched_hashes:
+                            data["doi"].append({
+                                "hash": _rh,
+                                "direction": "unknown",
+                                "value": 0,
+                                "symbol": "DOI",
+                                "timestamp": 0,
+                                "from": "",
+                                "to": "",
+                                "block": _raw.get("height", 0),
+                            })
+                logger.debug(f"DOI-History: {len(data.get('doi', []))} TXs (enriched)")
+            except Exception as e:
+                logger.debug(f"DOI-History Error: {e}", exc_info=True)
+                data["doi"] = []
+                incomplete.append("DOI")
+
+        # Tron-Transaktionen
+        if wm.tron:
+            _say("⏳ Lade TRX-Transaktionen...")
+            try:
+                trx_hist = wm.tron.get_history(limit=limit)
+                if isinstance(trx_hist, list):
+                    data["trx"] = trx_hist
+                elif isinstance(trx_hist, dict) and "data" in trx_hist:
+                    data["trx"] = trx_hist["data"]
+                else:
+                    data["trx"] = []
+            except Exception as e:
+                logger.debug(f"TRX-History Error: {e}")
+                data["trx"] = []
+                incomplete.append("TRX")
+
+            _say("⏳ Lade USDT-Transaktionen...")
+            try:
+                usdt_hist = wm.tron.get_usdt_history(limit=limit)
+                if isinstance(usdt_hist, list):
+                    data["usdt"] = usdt_hist
+                elif isinstance(usdt_hist, dict) and "data" in usdt_hist:
+                    data["usdt"] = usdt_hist["data"]
+                else:
+                    data["usdt"] = []
+            except Exception as e:
+                logger.debug(f"USDT-History Error: {e}")
+                data["usdt"] = []
+                incomplete.append("USDT")
+
+        data["_incomplete"] = incomplete
+        return data
+
+    def _load_eth_history_rpc(self, wm, wdoi_txs: list = None, full: bool = False) -> list:
         """
         Lädt ETH-Transaktionshistory über Web3 RPC.
         Nutzt wDOI TX-Hashes + Etherscan API Fallback.
@@ -1893,8 +1999,9 @@ class WalletApp(ctk.CTk):
             ("Etherscan",
              f"https://api.etherscan.io/api?module=account&action=txlist"
              f"&address={addr}&startblock=0&endblock=99999999"
-             f"&page=1&offset=20&sort=desc"),
+             f"&page=1&offset={1000 if full else 50}&sort=desc"),
         ]
+        blockscout_max_pages = 40 if full else 1
 
         for api_name, url in api_sources:
             try:
@@ -1909,6 +2016,24 @@ class WalletApp(ctk.CTk):
                 if api_name == "Blockscout":
                     # Blockscout v2 Format: {"items": [{...}, ...]}
                     items = api_data.get("items", [])
+                    # v0.9.8: weitere Seiten (next_page_params) fuer den Export
+                    _next = api_data.get("next_page_params")
+                    _pages = 1
+                    while _next and _pages < blockscout_max_pages:
+                        import urllib.parse as _up
+                        _url2 = url + "?" + _up.urlencode({k: v for k, v in _next.items() if v is not None})
+                        _req2 = urllib.request.Request(_url2, headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                            "Accept": "application/json",
+                        })
+                        with urllib.request.urlopen(_req2, timeout=15) as _r2:
+                            _d2 = _json.loads(_r2.read().decode())
+                        _more = _d2.get("items", [])
+                        if not _more:
+                            break
+                        items.extend(_more)
+                        _next = _d2.get("next_page_params")
+                        _pages += 1
                     logger.debug(f"ETH-RPC: Blockscout lieferte {len(items)} TXs")
                     if items:
                         first = items[0]
@@ -2270,10 +2395,10 @@ class WalletApp(ctk.CTk):
 
                 raw = socket.create_connection((_host, _port), timeout=10)
                 try:
-                    try:
-                        import certifi
-                        ctx = _ssl.create_default_context(cafile=certifi.where())
-                    except ImportError:
+                    _cafile = _ca_bundle_path()
+                    if _cafile:
+                        ctx = _ssl.create_default_context(cafile=_cafile)
+                    else:
                         ctx = _ssl.create_default_context()
                     return ctx.wrap_socket(raw, server_hostname=_host)
                 except _ssl.SSLCertVerificationError:
@@ -2397,9 +2522,22 @@ class WalletApp(ctk.CTk):
 
         chain_filter = self._hist_filter.get()
 
+        # v0.9.8: Hinweis, wenn der Abruf einzelner Chains fehlschlug
+        incomplete = self._hist_data.get("_incomplete") or []
+        if incomplete:
+            ctk.CTkLabel(
+                self._hist_scroll,
+                text="⚠ Liste unvollständig – Abruf fehlgeschlagen für: "
+                     + ", ".join(incomplete) + " (Netzwerk prüfen, 🔄 erneut laden)",
+                font=ctk.CTkFont(size=12), text_color=COLOR_WARNING,
+                wraplength=700, justify="left",
+            ).pack(fill="x", pady=(0, 6))
+
         # Alle Transaktionen sammeln und normalisieren
         all_txs = []
         for chain, txs in self._hist_data.items():
+            if chain.startswith("_"):
+                continue
             if chain_filter != "Alle" and chain.lower() != chain_filter.lower():
                 continue
             if not isinstance(txs, list):
@@ -2441,8 +2579,14 @@ class WalletApp(ctk.CTk):
         except Exception:
             pass
 
-    def _normalize_tx(self, tx, chain):
-        """Normalisiert verschiedene TX-Formate in einheitliches Format."""
+    def _normalize_tx(self, tx, chain, wm=None):
+        """
+        Normalisiert verschiedene TX-Formate in einheitliches Format.
+
+        v0.9.8: `wm` optional – fuer den Export anderer Slots (Richtung
+        TRX/USDT haengt von der Tron-Adresse des jeweiligen Wallets ab).
+        """
+        _wm = wm or self.wm
         try:
             # Bereits normalisiertes Format (ETH/wDOI aus RPC Event Logs)
             if "hash" in tx and "direction" in tx and "symbol" in tx:
@@ -2513,7 +2657,7 @@ class WalletApp(ctk.CTk):
                 value = value / 1e6
 
                 direction = "sent"
-                addr = self.wm.tron.primary_address if self.wm and self.wm.tron else ""
+                addr = _wm.tron.primary_address if _wm and _wm.tron else ""
                 if addr and to_hex:
                     to_b58 = self._tron_hex_to_base58(to_hex)
                     if to_b58:
@@ -2558,7 +2702,7 @@ class WalletApp(ctk.CTk):
                         to_addr = pv.get("to_address", "")
 
                 direction = "sent"
-                addr = self.wm.tron.primary_address if self.wm and self.wm.tron else ""
+                addr = _wm.tron.primary_address if _wm and _wm.tron else ""
                 if addr and to_addr:
                     # to_addr kann Base58 (T...) oder Hex (41...) sein
                     if to_addr.startswith("41") and len(to_addr) == 42:
@@ -3489,6 +3633,7 @@ class WalletApp(ctk.CTk):
                 slot["dat_file"] = dat_file
                 slot["loaded"] = True
                 slot["balances"] = {"doi": 0, "trx": 0, "usdt": 0, "eth": 0, "wdoi": 0}
+                slot["bal_status"] = {}
                 slot["doi_connected"] = False
                 slot["price_doi"] = 0.0
 
@@ -3514,6 +3659,7 @@ class WalletApp(ctk.CTk):
             self.wm = slot["wm"]
             self.xt = slot.get("xt")
             self._balances = slot["balances"].copy()
+            self._bal_status = dict(slot.get("bal_status", {}))
             self._doi_connected = slot["doi_connected"]
             self._price_doi = slot["price_doi"]
 
@@ -3550,29 +3696,8 @@ class WalletApp(ctk.CTk):
             except Exception:
                 pass
 
-            # Salden laden
-            try:
-                doi_bal = wm.doi.get_balance(force_refresh=True)
-                slot["balances"]["doi"] = doi_bal.get("confirmed_doi", 0)
-            except Exception:
-                pass
-            try:
-                slot["balances"]["trx"] = wm.tron.get_trx_balance()
-            except Exception:
-                pass
-            try:
-                slot["balances"]["usdt"] = wm.tron.get_usdt_balance()
-            except Exception:
-                pass
-            if wm.eth:
-                try:
-                    slot["balances"]["eth"] = wm.eth.get_eth_balance()
-                except Exception:
-                    pass
-                try:
-                    slot["balances"]["wdoi"] = wm.eth.get_wdoi_balance()
-                except Exception:
-                    pass
+            # Salden laden (v0.9.8: gemeinsame Logik mit Status je Waehrung)
+            self._load_balances(wm, slot["balances"], slot.setdefault("bal_status", {}))
 
         # DOI-Preis einmal holen
         for slot in self._wallet_slots:
@@ -3627,6 +3752,7 @@ class WalletApp(ctk.CTk):
         def _apply():
             active = self._wallet_slots[self._active_slot]
             self._balances = active["balances"].copy()
+            self._bal_status = dict(active.get("bal_status", {}))
             self._doi_connected = active["doi_connected"]
             self._price_doi = active["price_doi"]
             self._refresh_dashboard()
@@ -3774,7 +3900,7 @@ class WalletApp(ctk.CTk):
             pass
 
         # Salden in den Slot-eigenen Speicher laden
-        self._load_balances(wm, slot["balances"])
+        self._load_balances(wm, slot["balances"], slot.setdefault("bal_status", {}))
 
         # DOI-Preis
         if xt:
@@ -3789,6 +3915,7 @@ class WalletApp(ctk.CTk):
             if slot_idx != self._active_slot:
                 return
             self._balances = slot["balances"].copy()
+            self._bal_status = dict(slot.get("bal_status", {}))
             self._doi_connected = slot["doi_connected"]
             self._price_doi = slot["price_doi"]
             self._refresh_dashboard()
@@ -3805,43 +3932,69 @@ class WalletApp(ctk.CTk):
     # Salden
     # ──────────────────────────────────────
 
-    def _load_balances(self, wm, balances):
+    def _load_balances(self, wm, balances, status=None):
         """
         Lädt Salden des uebergebenen Wallets in das uebergebene Dict.
+
+        v0.9.8: `status` (Dict je Waehrung) wird mit "ok"/"stale"/"error"
+        befuellt und zurueckgegeben; bei Fehlern bleibt der alte Wert stehen.
 
         Slot-gebunden (v0.9.6): wm + Ziel-Dict werden vom Aufrufer beim
         Thread-Start eingefroren, damit ein Tab-Wechsel waehrend des Ladens
         keine Salden in den falschen Slot schreibt.
         """
         if not wm:
-            return
+            return {}
+        if status is None:
+            status = {}
+
+        # v0.9.8: Bei Fehlern bleibt der letzte bekannte Wert stehen und der
+        # Status wird auf "error"/"stale" gesetzt. Vorher blieb nach einem
+        # Netzwerkfehler stillschweigend 0 stehen (Dashboard zeigte 0 DOI,
+        # obwohl der Info-Dialog aus dem Cache den echten Saldo kannte).
+        def _mark(chain, ok, had_value):
+            if ok:
+                status[chain] = "ok"
+            elif had_value or status.get(chain) in ("ok", "stale"):
+                status[chain] = "stale"
+            else:
+                status[chain] = "error"
 
         try:
             doi_bal = wm.doi.get_balance(force_refresh=True)
             balances["doi"] = doi_bal.get("confirmed_doi", 0)
-        except Exception:
-            pass
+            if doi_bal.get("complete", True):
+                status["doi"] = "ok"
+            else:
+                # Teilweise aus dem Cache – Wert ist plausibel, aber nicht frisch
+                status["doi"] = "stale"
+                logger.warning("DOI-Saldo unvollstaendig: %d Adresse(n) nicht abrufbar",
+                               len(doi_bal.get("stale_addresses", [])))
+        except Exception as e:
+            logger.warning("DOI-Saldo nicht abrufbar: %s", e)
+            _mark("doi", False, status.get("doi") == "ok")
 
-        try:
-            balances["trx"] = wm.tron.get_trx_balance()
-        except Exception:
-            pass
-
-        try:
-            balances["usdt"] = wm.tron.get_usdt_balance()
-        except Exception:
-            pass
+        for chain, fn in (("trx", getattr(wm.tron, "get_trx_balance", None)),
+                          ("usdt", getattr(wm.tron, "get_usdt_balance", None))):
+            if not fn:
+                continue
+            try:
+                balances[chain] = fn()
+                status[chain] = "ok"
+            except Exception as e:
+                logger.warning("%s-Saldo nicht abrufbar: %s", chain.upper(), e)
+                _mark(chain, False, status.get(chain) == "ok")
 
         if wm.eth:
-            try:
-                balances["eth"] = wm.eth.get_eth_balance()
-            except Exception:
-                pass
-
-            try:
-                balances["wdoi"] = wm.eth.get_wdoi_balance()
-            except Exception:
-                pass
+            for chain, fn in (("eth", wm.eth.get_eth_balance),
+                              ("wdoi", wm.eth.get_wdoi_balance)):
+                try:
+                    balances[chain] = fn()
+                    status[chain] = "ok"
+                except Exception as e:
+                    logger.warning("%s-Saldo nicht abrufbar: %s", chain.upper(), e)
+                    _mark(chain, False, status.get(chain) == "ok")
+        return status
 
     def _refresh_balances_async(self):
         """Salden im Hintergrund aktualisieren."""
@@ -3859,7 +4012,7 @@ class WalletApp(ctk.CTk):
         if not wm:
             return
 
-        self._load_balances(wm, slot["balances"])
+        self._load_balances(wm, slot["balances"], slot.setdefault("bal_status", {}))
         if xt:
             try:
                 t = xt.get_ticker()
@@ -3871,6 +4024,7 @@ class WalletApp(ctk.CTk):
             if slot_idx != self._active_slot:
                 return
             self._balances = slot["balances"].copy()
+            self._bal_status = dict(slot.get("bal_status", {}))
             self._price_doi = slot["price_doi"]
             self._refresh_dashboard()
             self.conn_label.configure(
@@ -3878,13 +4032,35 @@ class WalletApp(ctk.CTk):
 
         self._safe_after(0, _apply)
 
+    _BAL_LABELS = {"doi": "DOI", "trx": "TRX", "usdt": "USDT", "eth": "ETH", "wdoi": "wDOI"}
+
     def _refresh_dashboard(self):
         """Dashboard-Anzeige aktualisieren."""
-        self._doi_card.configure(text=format_doi(self._balances["doi"]))
-        self._trx_card.configure(text=format_trx(self._balances["trx"]))
-        self._usdt_card.configure(text=format_usdt(self._balances["usdt"]))
-        self._eth_card.configure(text=format_eth(self._balances["eth"]))
-        self._wdoi_card.configure(text=format_wdoi(self._balances["wdoi"]))
+        cards = {
+            "doi": (self._doi_card, format_doi),
+            "trx": (self._trx_card, format_trx),
+            "usdt": (self._usdt_card, format_usdt),
+            "eth": (self._eth_card, format_eth),
+            "wdoi": (self._wdoi_card, format_wdoi),
+        }
+        problems = []
+        for chain, (card, fmt) in cards.items():
+            st = self._bal_status.get(chain)
+            if st == "error":
+                # Noch nie erfolgreich abgerufen: keinen falschen 0-Wert zeigen
+                card.configure(text="–", text_color=COLOR_TEXT_DIM)
+                problems.append(f"{self._BAL_LABELS[chain]}: nicht abrufbar")
+            elif st == "stale":
+                card.configure(text=fmt(self._balances[chain]) + " ⚠", text_color=COLOR_WARNING)
+                problems.append(f"{self._BAL_LABELS[chain]}: letzter bekannter Stand")
+            else:
+                card.configure(text=fmt(self._balances[chain]), text_color=COLOR_TEXT)
+        if problems:
+            self._bal_warn_label.configure(
+                text="⚠ Saldo-Abruf unvollständig – " + ", ".join(problems)
+                     + ". Netzwerk prüfen und 'Aktualisieren' drücken.")
+        else:
+            self._bal_warn_label.configure(text="")
 
         if self._price_doi > 0:
             doi_val = self._balances["doi"] * self._price_doi
@@ -4007,12 +4183,13 @@ class WalletApp(ctk.CTk):
                 # Abbrueche/Fehler duerfen das Limit nicht verbrauchen.
                 self._safe_after(0, lambda: self._add_daily_send(eur_value))
                 # Salden aktualisieren (in den Slot-eigenen Speicher)
-                self._load_balances(wm, slot["balances"])
+                self._load_balances(wm, slot["balances"], slot.setdefault("bal_status", {}))
 
                 def _apply_balances():
                     if slot_idx != self._active_slot:
                         return
                     self._balances = slot["balances"].copy()
+                    self._bal_status = dict(slot.get("bal_status", {}))
                     self._refresh_dashboard()
 
                 self._safe_after(500, _apply_balances)
@@ -4285,6 +4462,156 @@ class WalletApp(ctk.CTk):
     # ──────────────────────────────────────
 
 
+    # ──────────────────────────────────────
+    # Export (v0.9.8)
+    # ──────────────────────────────────────
+
+    def _open_export_dialog(self):
+        """Oeffnet den Export-Dialog (Transaktionen als CSV/Excel)."""
+        loaded = [(i, s["name"]) for i, s in enumerate(self._wallet_slots)
+                  if s["loaded"] and s["wm"]]
+        if not loaded:
+            self._show_error("Kein Wallet geladen – nichts zu exportieren.")
+            return
+        if getattr(self, "_export_running", False):
+            self._show_error("Ein Export läuft bereits.")
+            return
+        dlg = ExportDialog(self, loaded, self._active_slot)
+        self.wait_window(dlg)
+        if dlg.result:
+            self._run_export(dlg.result)
+
+    def _run_export(self, opts: dict):
+        """
+        Fuehrt den Export im Hintergrund aus.
+
+        opts: {"slots": [idx, ...], "symbols": [..], "format": "csv"|"xlsx",
+               "full": bool, "path": str}
+        CSV : eine Datei je Wallet und Waehrung im gewaehlten Ordner
+              (+ eine Gesamtdatei)
+        XLSX: eine Arbeitsmappe, ein Blatt je Wallet und Waehrung (+ "Gesamt")
+        """
+        self._export_running = True
+        progress = ctk.CTkToplevel(self)
+        progress.title("Export läuft")
+        progress.geometry("460x150")
+        progress.configure(fg_color=COLOR_BG)
+        progress.transient(self)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+        ctk.CTkLabel(progress, text="⬇  Transaktionen werden exportiert",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=COLOR_ACCENT).pack(pady=(18, 6))
+        status_lbl = ctk.CTkLabel(progress, text="Starte...",
+                                  font=ctk.CTkFont(size=12), text_color=COLOR_TEXT_DIM,
+                                  wraplength=420)
+        status_lbl.pack(pady=(0, 10))
+
+        def _status(text):
+            self._safe_after(0, lambda: status_lbl.configure(text=text))
+
+        def _worker():
+            written = []
+            errors = []
+            all_rows = []
+            sheets = {}
+            try:
+                for slot_idx in opts["slots"]:
+                    slot = self._wallet_slots[slot_idx]
+                    wm = slot["wm"]
+                    name = slot["name"]
+                    if not wm:
+                        continue
+                    _status(f"{name}: lade Transaktionen...")
+                    if opts["full"] or not slot.get("hist_data"):
+                        data = self._fetch_history_data(
+                            wm, full=opts["full"],
+                            status_cb=lambda txt, n=name: _status(f"{n}: {txt}"))
+                        slot["hist_data"] = data
+                    else:
+                        data = slot["hist_data"]
+                    if data.get("_incomplete"):
+                        errors.append(f"{name}: unvollständig ({', '.join(data['_incomplete'])})")
+
+                    normalized = []
+                    for chain, txs in data.items():
+                        if chain.startswith("_") or not isinstance(txs, list):
+                            continue
+                        for tx in txs:
+                            n = self._normalize_tx(tx, chain, wm=wm)
+                            if n:
+                                normalized.append(n)
+
+                    for symbol in opts["symbols"]:
+                        rows = tx_export.build_rows(name, symbol, normalized, self._tx_notes)
+                        all_rows.extend(rows)
+                        if not rows and not opts.get("empty_files", False):
+                            continue
+                        if opts["format"] == "csv":
+                            fname = tx_export.export_filename(name, symbol, "csv")
+                            written.append(tx_export.write_csv(Path(opts["path"]) / fname, rows))
+                        else:
+                            sheets[f"{name} – {symbol}"] = rows
+
+                if opts["format"] == "csv":
+                    if len(opts["slots"]) > 1 or len(opts["symbols"]) > 1:
+                        fname = tx_export.export_filename("Alle-Wallets", "Gesamt", "csv")
+                        written.append(tx_export.write_csv(Path(opts["path"]) / fname, all_rows))
+                else:
+                    if len(sheets) != 1:
+                        sheets = {"Gesamt": all_rows, **sheets}
+                    written.append(tx_export.write_xlsx(opts["path"], sheets))
+            except Exception as e:
+                logger.error("Export fehlgeschlagen: %s", e, exc_info=True)
+                errors.append(f"Fehler: {e}")
+
+            def _done():
+                self._export_running = False
+                try:
+                    progress.destroy()
+                except Exception:
+                    pass
+                lines = []
+                if written:
+                    lines.append(f"{len(written)} Datei(en) geschrieben, "
+                                 f"{len(all_rows)} Transaktion(en):")
+                    for w in written[:8]:
+                        lines.append("• " + os.path.basename(w))
+                    if len(written) > 8:
+                        lines.append(f"• ... und {len(written) - 8} weitere")
+                    lines.append("")
+                    lines.append("Ordner: " + os.path.dirname(written[0]))
+                else:
+                    lines.append("Keine Datei geschrieben.")
+                if errors:
+                    lines.append("")
+                    lines.append("Hinweise:")
+                    lines.extend("• " + e for e in errors)
+                self._show_info_popup("Export abgeschlossen" if written else "Export fehlgeschlagen",
+                                      "\n".join(lines))
+
+            self._safe_after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_info_popup(self, title: str, msg: str):
+        """Einfaches Hinweisfenster (mehrzeilig, markierbarer Text)."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(title)
+        dialog.geometry("560x360")
+        dialog.configure(fg_color=COLOR_BG)
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text=title, font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=COLOR_ACCENT).pack(pady=(16, 6))
+        box = ctk.CTkTextbox(dialog, font=ctk.CTkFont(size=12), fg_color=COLOR_CARD,
+                             text_color=COLOR_TEXT, corner_radius=RADIUS_CARD)
+        box.pack(fill="both", expand=True, padx=16, pady=4)
+        box.insert("1.0", msg)
+        box.configure(state="disabled")
+        ctk.CTkButton(dialog, text="OK", height=34, fg_color=COLOR_ACCENT,
+                      hover_color=COLOR_ACCENT_HOVER, command=dialog.destroy
+                      ).pack(pady=(6, 14), padx=16, fill="x")
+
     def _show_info_dialog(self):
         """
         Info-Dialog: App-Version, geladene Wallet-Slots, Pfade.
@@ -4378,6 +4705,17 @@ class WalletApp(ctk.CTk):
         if not any_loaded:
             lines.append("  (Keine Wallets geladen)")
             lines.append("")
+
+        # v0.9.8: Ressourcen-Check (Diagnose fuer "Language not detected" u.ae.)
+        lines.append("─── Ressourcen ──────────────────────────────────")
+        lines.append(f"BIP-39-Wortliste : eingebettet [{'OK' if _verify_wordlist() else 'FEHLER'}]")
+        _ca = _ca_bundle_path()
+        if _ca:
+            lines.append(f"CA-Bundle        : {_ca}  [{'gefunden' if os.path.exists(_ca) else 'FEHLT'}]")
+        if getattr(sys, "frozen", False):
+            _mei = getattr(sys, "_MEIPASS", "")
+            lines.append(f"Temp-Verzeichnis : {_mei}  [{'vorhanden' if _mei and os.path.isdir(_mei) else 'FEHLT'}]")
+        lines.append("")
 
         lines.append("─── Quellen ─────────────────────────────────────")
         lines.append(f"GitHub: {GITHUB_URL}")
@@ -4874,11 +5212,156 @@ class WalletApp(ctk.CTk):
 
 
 # ──────────────────────────────────────────────
+# Export-Dialog (v0.9.8)
+# ──────────────────────────────────────────────
+
+class ExportDialog(ctk.CTkToplevel):
+    """
+    Auswahl fuer den Transaktions-Export: Wallets, Waehrungen, Format,
+    Umfang. Ergebnis in self.result (dict) oder None bei Abbruch.
+    """
+
+    def __init__(self, parent, loaded_slots, active_slot):
+        super().__init__(parent)
+        self.title("Transaktionen exportieren")
+        self.geometry("520x560")
+        self.configure(fg_color=COLOR_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+        self._loaded = loaded_slots
+
+        ctk.CTkLabel(self, text="⬇  Transaktionen exportieren",
+                     font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=COLOR_ACCENT).pack(pady=(18, 4))
+        ctk.CTkLabel(self, text="Je Wallet und Währung eine CSV-Datei bzw. ein Excel-Blatt.",
+                     font=ctk.CTkFont(size=12), text_color=COLOR_TEXT_DIM).pack(pady=(0, 10))
+
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16)
+
+        # Wallets
+        ctk.CTkLabel(body, text="Wallets", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(4, 2))
+        self._wallet_vars = {}
+        for idx, name in loaded_slots:
+            var = ctk.BooleanVar(value=(idx == active_slot))
+            self._wallet_vars[idx] = var
+            ctk.CTkCheckBox(body, text=name, variable=var, font=ctk.CTkFont(size=12),
+                            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER
+                            ).pack(anchor="w", padx=8, pady=1)
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", pady=(2, 6))
+        ctk.CTkButton(row, text="Alle", width=70, height=26, fg_color=COLOR_CARD,
+                      hover_color="#2a3a5c", command=lambda: self._set_all(self._wallet_vars, True)
+                      ).pack(side="left", padx=(8, 4))
+        ctk.CTkButton(row, text="Keine", width=70, height=26, fg_color=COLOR_CARD,
+                      hover_color="#2a3a5c", command=lambda: self._set_all(self._wallet_vars, False)
+                      ).pack(side="left")
+
+        # Waehrungen
+        ctk.CTkLabel(body, text="Währungen", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(6, 2))
+        self._symbol_vars = {}
+        sym_row = ctk.CTkFrame(body, fg_color="transparent")
+        sym_row.pack(fill="x")
+        for sym in tx_export.SYMBOLS:
+            var = ctk.BooleanVar(value=True)
+            self._symbol_vars[sym] = var
+            ctk.CTkCheckBox(sym_row, text=sym, variable=var, width=80,
+                            font=ctk.CTkFont(size=12), fg_color=COLOR_ACCENT,
+                            hover_color=COLOR_ACCENT_HOVER).pack(side="left", padx=(8, 2))
+
+        # Format
+        ctk.CTkLabel(body, text="Format", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(10, 2))
+        formats = ["CSV (Excel-kompatibel)"]
+        if tx_export.HAS_OPENPYXL:
+            formats.append("Excel (.xlsx)")
+        self._format = ctk.CTkSegmentedButton(body, values=formats,
+                                              selected_color=COLOR_ACCENT,
+                                              selected_hover_color=COLOR_ACCENT_HOVER)
+        self._format.set(formats[-1] if tx_export.HAS_OPENPYXL else formats[0])
+        self._format.pack(fill="x", padx=8)
+        if not tx_export.HAS_OPENPYXL:
+            ctk.CTkLabel(body, text="Excel-Export nicht verfügbar (openpyxl fehlt).",
+                         font=ctk.CTkFont(size=11), text_color=COLOR_TEXT_DIM).pack(anchor="w", padx=8)
+
+        # Umfang
+        ctk.CTkLabel(body, text="Umfang", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLOR_TEXT, anchor="w").pack(fill="x", pady=(10, 2))
+        self._full_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(body, text="Alle Transaktionen vollständig neu laden (empfohlen, dauert länger)",
+                        variable=self._full_var, font=ctk.CTkFont(size=12),
+                        fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER
+                        ).pack(anchor="w", padx=8, pady=1)
+        ctk.CTkLabel(body, text="Ohne Haken wird die zuletzt angezeigte Liste exportiert "
+                                "(max. 200 je Währung).",
+                     font=ctk.CTkFont(size=11), text_color=COLOR_TEXT_DIM,
+                     wraplength=440, justify="left").pack(anchor="w", padx=8)
+
+        self._err = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=12),
+                                 text_color=COLOR_ERROR)
+        self._err.pack()
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(4, 16))
+        ctk.CTkButton(btns, text="Abbrechen", height=36, fg_color=COLOR_CARD,
+                      hover_color="#2a3a5c", command=self._cancel).pack(side="left", expand=True,
+                                                                         fill="x", padx=(0, 6))
+        ctk.CTkButton(btns, text="Exportieren…", height=36, fg_color=COLOR_ACCENT,
+                      hover_color=COLOR_ACCENT_HOVER, command=self._confirm
+                      ).pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    @staticmethod
+    def _set_all(vars_dict, value):
+        for v in vars_dict.values():
+            v.set(value)
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def _confirm(self):
+        from tkinter import filedialog
+        slots = [i for i, v in self._wallet_vars.items() if v.get()]
+        symbols = [s for s, v in self._symbol_vars.items() if v.get()]
+        if not slots:
+            self._err.configure(text="Bitte mindestens ein Wallet auswählen.")
+            return
+        if not symbols:
+            self._err.configure(text="Bitte mindestens eine Währung auswählen.")
+            return
+        fmt = "xlsx" if self._format.get().startswith("Excel") else "csv"
+        if fmt == "csv":
+            path = filedialog.askdirectory(parent=self, title="Zielordner für CSV-Dateien")
+        else:
+            from datetime import datetime as _dt
+            path = filedialog.asksaveasfilename(
+                parent=self, title="Excel-Datei speichern",
+                defaultextension=".xlsx",
+                initialfile=f"Transaktionen_{_dt.now().strftime('%Y-%m-%d')}.xlsx",
+                filetypes=[("Excel-Arbeitsmappe", "*.xlsx")])
+        if not path:
+            return
+        self.result = {
+            "slots": slots,
+            "symbols": symbols,
+            "format": fmt,
+            "full": bool(self._full_var.get()),
+            "path": path,
+        }
+        self.destroy()
+
+
+# ──────────────────────────────────────────────
 # Hauptprogramm
 # ──────────────────────────────────────────────
 
 def main():
     setup_logging()
+    ensure_persistent_ca_bundle()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
 

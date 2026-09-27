@@ -19,6 +19,9 @@ eth-account>=0.11.0
 # bip-utils>=2.9.0   # entfernt: nicht verwendet, benötigt C++-Compiler.
 #                    # BIP-32/44 wird in src/wallet/seed_manager.py manuell abgeleitet.
 
+# ── Export (v0.9.8) ──
+openpyxl>=3.1.0        # Excel-Export der Transaktionen (CSV geht auch ohne)
+
 # ── Netzwerk & Konfiguration ──
 requests>=2.31.0
 PyYAML>=6.0

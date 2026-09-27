@@ -35,6 +35,7 @@ try:
     from web3 import Web3
     from web3.middleware import ExtraDataToPOAMiddleware
     from eth_account import Account
+    from eth_account.hdaccount import key_from_seed
     # Aktiviere HD-Wallet-Support (BIP-44 Ableitung)
     Account.enable_unaudited_hdwallet_features()
     HAS_WEB3 = True
@@ -43,6 +44,7 @@ except ImportError:
     logger.warning("web3 nicht installiert. pip install web3 eth-account")
 
 from .eth_network import ETH_MAINNET, ERC20_ABI
+from .bip39_wordlist import get_mnemonic
 
 
 # ──────────────────────────────────────────────
@@ -172,6 +174,43 @@ class EthWallet:
     # Wallet-Erstellung / Ableitung
     # ──────────────────────────────────────
 
+    @staticmethod
+    def _account_from_mnemonic(mnemonic: str, path: str):
+        """
+        BIP-39/BIP-44-Ableitung ohne Dateizugriff (v0.9.8).
+
+        Account.from_mnemonic() aus eth_account laedt bei jedem Aufruf die
+        Wortlisten aller Sprachen von der Festplatte (detect_language). Im
+        Onefile-Build liegen diese im temporaeren Entpackverzeichnis und
+        koennen waehrend der Laufzeit verschwinden. Ausserdem enthaelt die
+        Fehlermeldung von eth_account >= 0.13 die Seed-Woerter im Klartext.
+
+        Hier wird der Seed deshalb mit der eingebetteten Wortliste erzeugt
+        (identische BIP-39-Semantik: NFKD + PBKDF2-HMAC-SHA512) und der
+        Schluessel mit eth_account's eigener BIP-32-Implementierung
+        (key_from_seed) abgeleitet. Ergebnis ist bitidentisch zu
+        Account.from_mnemonic(mnemonic, account_path=path), siehe
+        tests/test_regressions.py::TestEthDerivation.
+
+        Hinweis: Wie bisher wird fuer ETH KEINE BIP-39-Passphrase verwendet
+        (Kompatibilitaet zu bestehenden Wallets).
+        """
+        mnemo = get_mnemonic()
+        if not mnemo.check(mnemonic):
+            raise ValueError(
+                "ETH-Adressableitung fehlgeschlagen: Seed-Phrase ungültig"
+            )
+        try:
+            seed = mnemo.to_seed(mnemonic, passphrase="")
+            private_key = key_from_seed(seed, path)
+            return Account.from_key(private_key)
+        except Exception as e:
+            # Kein str(e) durchreichen: koennte Geheimnisse enthalten.
+            raise ValueError(
+                "ETH-Adressableitung fehlgeschlagen "
+                f"(eth-account-Fehler: {type(e).__name__})"
+            ) from e
+
     def from_mnemonic(self, mnemonic: str, account_index: int = 0) -> str:
         """
         Leitet die Ethereum-Adresse aus einer BIP-39 Seed-Phrase ab.
@@ -191,21 +230,11 @@ class EthWallet:
 
         path = f"m/44'/60'/0'/0/{account_index}"
 
-        # HD-Wallet-Features sicherstellen (idempotent; normalerweise
-        # bereits beim Modul-Import aktiviert)
-        Account.enable_unaudited_hdwallet_features()
-
         # WICHTIG: Kein manueller BIP-32-Fallback! Ein früherer Fallback
         # hat bei beliebigen Fehlern (z.B. ungültiger Mnemonic) FALSCHE
         # Adressen abgeleitet – dorthin gesendete Coins wären verloren.
         # Fehler werden stattdessen mit klarer Meldung weitergereicht.
-        try:
-            acct = Account.from_mnemonic(mnemonic, account_path=path)
-        except Exception as e:
-            raise ValueError(
-                f"ETH-Adressableitung fehlgeschlagen – Mnemonic ungültig "
-                f"oder eth-account-Fehler: {e}"
-            ) from e
+        acct = self._account_from_mnemonic(mnemonic, path)
 
         self._private_key = acct.key.hex()
         if self._private_key.startswith("0x"):
@@ -232,7 +261,7 @@ class EthWallet:
         addresses = []
         for i in range(count):
             path = f"m/44'/60'/0'/0/{i}"
-            acct = Account.from_mnemonic(mnemonic, account_path=path)
+            acct = self._account_from_mnemonic(mnemonic, path)
             addresses.append({
                 "index": i,
                 "address": acct.address,
@@ -588,10 +617,14 @@ class EthWallet:
         logger.info("ETH-History: Nicht über kostenlose RPCs verfügbar (nutze Etherscan Explorer)")
         return []
 
-    def get_wdoi_history(self, address: str = None, limit: int = 20) -> List[Dict]:
+    # Blockscout liefert ca. 50 Transfers je Seite; Deckel fuer "alle"
+    WDOI_HISTORY_MAX_PAGES = 100
+
+    def get_wdoi_history(self, address: str = None, limit: Optional[int] = 20) -> List[Dict]:
         """
         Ruft wDOI (ERC-20) Transfer-History ab.
-        Primaer: Blockscout Token-Transfer API (unbegrenzt).
+        Primaer: Blockscout Token-Transfer API (seitenweise, v0.9.8:
+        limit=None laedt alle Seiten bis WDOI_HISTORY_MAX_PAGES).
         Fallback: RPC Event Logs.
         """
         addr = address or self._address
@@ -610,18 +643,34 @@ class EthWallet:
             addr_lower = addr.lower()
             contract_lower = contract_addr_str.lower()
             url = f"https://eth.blockscout.com/api/v2/addresses/{addr_lower}/token-transfers"
-            params = {"token": contract_lower, "type": "ERC-20", "limit": limit}
+            base_params = {"token": contract_lower, "type": "ERC-20"}
 
             logger.debug(f"wDOI-History: Blockscout -> {url}")
-            resp = requests.get(url, params=params, timeout=15)
-
-            if resp.status_code == 200:
+            items: List[Dict] = []
+            next_params: Optional[Dict] = None
+            last_status = None
+            max_pages = self.WDOI_HISTORY_MAX_PAGES if limit is None else 1 + (limit // 50)
+            for _ in range(max_pages):
+                params = dict(base_params)
+                if next_params:
+                    params.update(next_params)
+                resp = requests.get(url, params=params, timeout=15)
+                last_status = resp.status_code
+                if resp.status_code != 200:
+                    break
                 data = resp.json()
-                items = data.get("items", [])
-                logger.debug(f"wDOI-History: Blockscout lieferte {len(items)} Transfers")
+                page = data.get("items", [])
+                items.extend(page)
+                next_params = data.get("next_page_params")
+                if not page or not next_params:
+                    break
+                if limit is not None and len(items) >= limit:
+                    break
+            logger.debug(f"wDOI-History: Blockscout lieferte {len(items)} Transfers")
 
+            if last_status == 200:
                 result = []
-                for item in items[:limit]:
+                for item in (items if limit is None else items[:limit]):
                     try:
                         from_addr = item.get("from", {}).get("hash", "")
                         to_addr = item.get("to", {}).get("hash", "")
@@ -666,7 +715,7 @@ class EthWallet:
                     logger.info(f"wDOI-History: {len(result)} Transfers (Blockscout)")
                     return result
 
-            logger.debug(f"wDOI-History: Blockscout Status {resp.status_code}")
+            logger.debug(f"wDOI-History: Blockscout Status {last_status}")
         except Exception as e:
             logger.debug(f"wDOI-History: Blockscout fehlgeschlagen: {e}")
 
