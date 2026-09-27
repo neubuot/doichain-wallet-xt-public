@@ -108,7 +108,7 @@ def _ca_bundle_path() -> Optional[str]:
 # ──────────────────────────────────────────────
 
 APP_NAME = "DOI-Wallet-iX"
-APP_VERSION = "0.9.8"
+APP_VERSION = "0.9.9"
 COPYRIGHT = "© 2026 Ottmar Neuburger, WEBanizer AG"
 LICENSE_INFO = "Open Source – MIT License"
 GITHUB_URL = "https://github.com/neubuot/doichain-wallet-xt"
@@ -4761,16 +4761,62 @@ class WalletApp(ctk.CTk):
         text.insert("1.0", "⏳ Sammle Diagnose...")
         text.configure(state="disabled")
 
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=15, pady=10)
         ctk.CTkButton(
-            dialog, text="Schliessen", height=35,
+            btn_row, text="Schliessen", height=35,
             fg_color=COLOR_ACCENT, command=dialog.destroy,
-        ).pack(pady=10)
+        ).pack(side="left", expand=True, fill="x", padx=(0, 6))
+        deep_btn = ctk.CTkButton(
+            btn_row, text="🔎 Tiefensuche (Gap 300)", height=35,
+            fg_color=COLOR_CARD, hover_color="#2a3a5c",
+            border_width=1, border_color=COLOR_ACCENT,
+        )
+        deep_btn.pack(side="left", expand=True, fill="x", padx=(6, 0))
 
         # Kontext fuer den Worker einfrieren
         wm = self.wm
         slot = self._wallet_slots[self._active_slot]
         active_slot = self._active_slot
         block_heights = dict(self._block_heights)
+        slot_idx = active_slot
+
+        def _deep_scan():
+            """v0.9.9: Tiefensuche im Worker, danach Salden und Liste neu laden."""
+            if not wm or not wm.doi or not wm.doi.electrum:
+                self._show_error("Tiefensuche: DOI-Wallet nicht verbunden.")
+                return
+            deep_btn.configure(state="disabled", text="⏳ Tiefensuche laeuft (kann 1 bis 2 Minuten dauern)...")
+
+            def _run():
+                try:
+                    diag = wm.deep_scan(gap_limit=300)
+                    msg = (f"Tiefensuche fertig: Empfang bis Index {diag['receive'].get('max_used_index')}, "
+                           f"Wechselgeld bis Index {diag['change'].get('max_used_index')}, "
+                           f"{diag.get('known_addresses_total')} Adressen bekannt.")
+                    self._load_balances(wm, slot["balances"], slot.setdefault("bal_status", {}))
+                except Exception as e:
+                    msg = f"Tiefensuche fehlgeschlagen: {e}"
+
+                def _done():
+                    try:
+                        deep_btn.configure(state="normal", text="🔎 Tiefensuche (Gap 300)")
+                        text.configure(state="normal")
+                        text.insert("end", "\n\n" + msg)
+                        text.configure(state="disabled")
+                    except Exception:
+                        pass
+                    if slot_idx == self._active_slot:
+                        self._balances = slot["balances"].copy()
+                        self._bal_status = dict(slot.get("bal_status", {}))
+                        self._refresh_dashboard()
+                        self._refresh_history_async(force=True)
+
+                self._safe_after(0, _done)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        deep_btn.configure(command=_deep_scan)
 
         def _gather():
             lines = self._collect_debug_lines(wm, slot, active_slot, block_heights)
@@ -4811,6 +4857,12 @@ class WalletApp(ctk.CTk):
                 change_addrs = [a for a, i in addrs.items() if i.get('change') == 1]
                 lines.append(f"  Empfangs-Adressen: {len(receive_addrs)}")
                 lines.append(f"  Wechselgeld-Adressen: {len(change_addrs)}")
+                # v0.9.9: Indizes (naechster freier / letzter benutzter)
+                mu = getattr(doi, "_max_used", {}) or {}
+                lines.append(f"  Naechster Index: Empfang {getattr(doi, '_receive_index', '?')}, "
+                             f"Wechselgeld {getattr(doi, '_change_index', '?')}")
+                lines.append(f"  Letzter benutzter Index: Empfang {mu.get(0)}, Wechselgeld {mu.get(1)}")
+                lines.append(f"  Beobachtete Adressen: {len(getattr(doi, '_watch', []) or [])}")
 
                 # Primary Address
                 try:
@@ -4834,7 +4886,7 @@ class WalletApp(ctk.CTk):
                     lines.append("")
                     lines.append("Adressen mit Guthaben:")
                     found_any = False
-                    for addr in list(addrs.keys())[:30]:
+                    for addr in (doi._active_addresses() if hasattr(doi, "_active_addresses") else list(addrs.keys())[:30]):
                         try:
                             ab = doi.electrum.get_balance(addr)
                             total = ab.get('confirmed', 0) + ab.get('unconfirmed', 0)

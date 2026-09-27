@@ -1,6 +1,6 @@
 # DOI-Wallet-iX – Benutzerhandbuch
 
-**Version 0.9.8 (Beta)**
+**Version 0.9.9 (Beta)**
 
 Multi-Chain Desktop Wallet für DOI, TRX, USDT, ETH und wDOI mit XT.com
 Exchange-Integration, Multi-Wallet-Tabs, Transaktions-Notizen, Tageslimit und
@@ -295,6 +295,14 @@ Wert 0 = sofortiges Senden.
 
 ### 10.3 Wallet-Diagnose
 
+**Tiefensuche (seit v0.9.9):** Der Knopf im Diagnose-Fenster durchsucht beide
+Adressketten mit einer Lücke von 300 Adressen und findet Guthaben auf hohen
+Indizes, zum Beispiel aus Wallets, die mit v0.9.5 bis v0.9.8 benutzt wurden.
+Die Suche dauert je nach Server ein bis zwei Minuten, danach werden Salden
+und Transaktionsliste neu geladen und die Zustandsdatei gespeichert. Die
+Diagnose zeigt außerdem den nächsten freien und den letzten benutzten Index
+je Kette.
+
 Der Diagnose-Button zeigt technische Details: Bekannte Adressen,
 ElectrumX-Status, Balancen pro Adresse, Tron/ETH-Status. Nützlich für die
 Fehlerbehebung. Die Diagnose läuft seit v0.9.7 im Hintergrund – die Oberfläche
@@ -329,6 +337,7 @@ durch echte Entschlüsselung der Wallet-Datei verifiziert (seit v0.9.7).
 |---------|--------|
 | Wallet startet nicht | Keine andere Instanz laufen lassen. |
 | Salden zeigen 0 | „Aktualisieren" klicken. Verbindungs-Indikatoren prüfen. Diagnose-Button nutzen. Seit v0.9.8 bleibt bei Netzwerkfehlern der letzte bekannte Saldo mit ⚠ stehen, und eine gelbe Hinweiszeile nennt die betroffene Währung. |
+| Guthaben fehlt nach Neuinstallation oder neuer Zustandsdatei, obwohl der Seed stimmt | Fehler in v0.9.5 bis v0.9.8: Neue Adressen wurden ab Index 50 vergeben, eine frische Adresssuche hörte nach 50 leeren Adressen auf und sah sie nie. Seit v0.9.9 sucht das Wallet automatisch weiter. Falls trotzdem etwas fehlt: Einstellungen, Wallet-Diagnose, „Tiefensuche (Gap 300)". |
 | „Wallet-Fehler: Language not detected" | Betraf v0.9.7 und älter: Die EXE entpackt sich in einen temporären Ordner, den Windows (Speicheroptimierung, Datenträgerbereinigung) oder ein Virenscanner bei tagelang laufender App aufräumen kann. Danach fehlt die BIP-39-Wortliste, und weitere Wallets lassen sich nicht öffnen. Sofortlösung: Wallet beenden und neu starten. Seit v0.9.8 ist die Wortliste fest in das Programm eingebettet, der Fehler kann nicht mehr auftreten. |
 | Salden oder Transaktionen fehlen nur bei manchen Tabs | Bei vielen gleichzeitig geladenen Wallets bricht der ElectrumX-Server einzelne Abfragen ab. Seit v0.9.8 wird das als ⚠ bzw. „Liste unvollständig" angezeigt. „Aktualisieren" bzw. 🔄 im jeweiligen Tab wiederholt den Abruf. |
 | ETH zeigt ✕ | Internetverbindung prüfen. ETH benötigt RPC-Verbindung. Bei älteren EXE-Builds: auf v0.9.7 aktualisieren (Bundling-Fehler behoben). |
@@ -343,6 +352,24 @@ durch echte Entschlüsselung der Wallet-Datei verifiziert (seit v0.9.7).
 ---
 
 ## 13. Changelog
+
+### v0.9.9 – Adresssuche repariert
+
+- **FIX Adresssuche (kritisch):** Seit v0.9.5 setzte das Wallet nach jeder
+  Adresssuche den nächsten freien Index auf „letzter benutzter plus 51" statt
+  „plus 1". Wechselgeld und neu ausgegebene Empfangsadressen lagen dadurch ab
+  Index 50. Nach einer Neuinstallation oder verlorener Zustandsdatei brach die
+  Suche nach 50 leeren Adressen ab und zeigte diese Guthaben nicht an. Die
+  Coins waren nie in Gefahr, nur unsichtbar.
+- Die Adresssuche prüft jetzt mindestens bis zum gespeicherten Index plus
+  Lücke, und ohne Zustandsdatei automatisch mit einer Lücke von 120.
+- Aufgeblähte Indizes aus alten Zustandsdateien werden auf den korrekten
+  Wert zurückgesetzt, sobald die Suche die Adressen darüber als leer bestätigt hat.
+- NEU: „Tiefensuche (Gap 300)" in der Wallet-Diagnose, dazu Anzeige der Indizes.
+- Saldo- und Listen-Abfragen fragen nur noch Adressen mit Historie und das
+  normale Fenster ab, nicht mehr jede jemals gescannte Adresse.
+- Zustandsdatei wird nach jeder Adresssuche gespeichert.
+- Neue Regressionstests (`tests/test_v099.py`, 8 Tests).
 
 ### v0.9.8 – Anzeige-Fixes und Export
 

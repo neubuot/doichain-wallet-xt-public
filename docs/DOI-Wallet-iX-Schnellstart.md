@@ -1,6 +1,6 @@
 # DOI-Wallet-iX – Schnellstart-Anleitung
 
-**Version 0.9.8 (Beta)**
+**Version 0.9.9 (Beta)**
 
 ---
 

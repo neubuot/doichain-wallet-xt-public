@@ -59,6 +59,12 @@ class DoiWallet:
     # Change-Output, etc.) grössere Lücken erzeugen können.
     GAP_LIMIT = 50
 
+    # v0.9.9: Gap fuer die Tiefensuche. Wird automatisch benutzt, wenn keine
+    # State-Datei vorlag (Neuinstallation, verlorene .state.json), damit
+    # Adressen gefunden werden, die aeltere Versionen (0.9.5 bis 0.9.8) wegen
+    # des Index-Fehlers (siehe discover_addresses) ab Index 50 vergeben haben.
+    DEEP_GAP_LIMIT = 120
+
     # Wie oft eine einzelne Adressabfrage bei transientem Netzwerkfehler
     # erneut versucht wird, bevor sie als endgültig fehlgeschlagen gilt.
     DISCOVER_RETRY = 2
@@ -77,6 +83,12 @@ class DoiWallet:
         self.last_history_complete: bool = True       # v0.9.8: siehe get_history()
         self.last_history_errors: int = 0
         self._last_discover_iso: Optional[str] = None
+        # v0.9.9
+        self._deep_scan_pending: bool = False         # naechste Discovery mit DEEP_GAP_LIMIT
+        self._max_used: dict[int, Optional[int]] = {0: None, 1: None}  # je Kette
+        self._watch: set[str] = set()                 # Adressen, die bei Saldo/UTXO/History abgefragt werden
+        self._receive_floor = 0                       # in dieser Sitzung bereits ausgegebene Indizes
+        self._change_floor = 0
 
     # ========================================================
     # Wallet erstellen / wiederherstellen
@@ -169,12 +181,16 @@ class DoiWallet:
         """Gibt eine neue, unbenutzte Empfangsadresse zurück."""
         keypair = self._register_keypair(self._receive_index, change=0)
         self._receive_index += 1
+        self._receive_floor = max(self._receive_floor, self._receive_index)
+        self._watch.add(keypair["address"])
         return keypair["address"]
 
     def get_new_change_address(self) -> str:
         """Gibt eine neue Wechselgeld-Adresse zurück."""
         keypair = self._register_keypair(self._change_index, change=1)
         self._change_index += 1
+        self._change_floor = max(self._change_floor, self._change_index)
+        self._watch.add(keypair["address"])
         return keypair["address"]
 
     def get_all_addresses(self) -> list[str]:
@@ -278,7 +294,12 @@ class DoiWallet:
         self._ensure_connected()
         from datetime import datetime, timezone
 
-        gl = gap_limit or self.GAP_LIMIT
+        if gap_limit:
+            gl = gap_limit
+        elif self._deep_scan_pending:
+            gl = self.DEEP_GAP_LIMIT
+        else:
+            gl = self.GAP_LIMIT
         t0 = time.monotonic()
         diag = {"gap_limit": gl, "receive": {}, "change": {}}
 
@@ -290,8 +311,17 @@ class DoiWallet:
             max_used: Optional[int] = None
             errors = 0
             completed = True
+            # v0.9.9: mindestens bis zum gespeicherten "naechsten Index" scannen
+            # (plus Gap dahinter). Die Versionen 0.9.5 bis 0.9.8 setzten diesen
+            # Index nach der Discovery auf max_used + 1 + GAP_LIMIT statt auf
+            # max_used + 1. Wechselgeld und neue Empfangsadressen lagen dadurch
+            # ab Index 50, und eine Discovery mit frischem State brach nach 50
+            # leeren Adressen ab, bevor sie dort ankam. Guthaben war dann
+            # unsichtbar, obwohl der Seed es besitzt.
+            min_scan = self._receive_index if change_flag == 0 else self._change_index
 
-            while gap < gl:
+            # <= : der gespeicherte "naechste" Index kann bereits benutzt sein
+            while gap < gl or index <= min_scan:
                 keypair = self.seed_manager.get_keypair(index=index, change=change_flag)
                 addr = keypair["address"]
                 if addr not in self._known_addresses:
@@ -314,8 +344,10 @@ class DoiWallet:
                     gap = 0
                     with_history += 1
                     max_used = index
+                    self._known_addresses[addr]["used"] = True
                 else:
                     gap += 1
+                    self._known_addresses[addr].setdefault("used", False)
                 index += 1
 
             diag[name] = {
@@ -331,12 +363,18 @@ class DoiWallet:
             # behalten wir den vorherigen Stand, statt einen zu kleinen Index
             # zu schreiben (der eine bereits benutzte Change-Adresse erneut
             # ausspucken würde).
+            self._max_used[change_flag] = max_used
             if completed:
-                target = index  # index ist genau der erste leere Index nach max_used + gap
+                # v0.9.9: naechster freier Index = letzter benutzter + 1. Alle
+                # Indizes darueber wurden soeben als leer verifiziert (min_scan
+                # plus Gap), ein aufgeblaehter Index aus alten State-Dateien darf
+                # deshalb zurueckgesetzt werden. In dieser Sitzung bereits
+                # ausgegebene Adressen (Floor) werden nicht erneut vergeben.
+                target = (max_used + 1) if max_used is not None else 0
                 if change_flag == 0:
-                    self._receive_index = max(self._receive_index, target)
+                    self._receive_index = max(target, self._receive_floor)
                 else:
-                    self._change_index = max(self._change_index, target)
+                    self._change_index = max(target, self._change_floor)
             elif max_used is not None:
                 bumped = max_used + 1
                 if change_flag == 0:
@@ -344,11 +382,40 @@ class DoiWallet:
                 else:
                     self._change_index = max(self._change_index, bumped)
 
+        self._deep_scan_pending = False
+        self._rebuild_watch()
         diag["known_addresses_total"] = len(self._known_addresses)
+        diag["watched_addresses"] = len(self._watch)
         diag["duration_sec"] = round(time.monotonic() - t0, 2)
         self._last_discover_iso = datetime.now(timezone.utc).isoformat()
         logger.info("Discovery fertig: %s", diag)
         return diag
+
+    def _rebuild_watch(self):
+        """
+        v0.9.9: Legt fest, welche bekannten Adressen bei Saldo-, UTXO- und
+        History-Abfragen beruecksichtigt werden: alle mit Historie, alle im
+        normalen Fenster (bis letzter benutzter Index plus GAP_LIMIT) und die
+        zuletzt ausgegebenen. Reine Scan-Adressen der Tiefensuche ohne
+        Historie werden nicht bei jedem Refresh erneut abgefragt.
+        """
+        watch = set()
+        for addr, kp in self._known_addresses.items():
+            chain = int(kp.get("change", 0))
+            idx = int(kp.get("index", 0))
+            mu = self._max_used.get(chain)
+            window_end = (mu if mu is not None else -1) + self.GAP_LIMIT
+            if kp.get("used") or idx <= window_end:
+                watch.add(addr)
+        # In dieser Sitzung ausgegebene Adressen bleiben beobachtet
+        # (werden in get_new_*_address zusaetzlich eingetragen).
+        self._watch = watch | (self._watch & set(self._known_addresses))
+
+    def _active_addresses(self) -> list[str]:
+        """Adressen fuer Netzwerkabfragen (siehe _rebuild_watch)."""
+        if not self._watch:
+            return list(self._known_addresses)
+        return [a for a in self._known_addresses if a in self._watch]
 
     # ========================================================
     # Saldo & UTXOs
@@ -375,7 +442,7 @@ class DoiWallet:
         unknown_addresses: list[str] = []    # Abfrage fehlgeschlagen, kein Cache-Wert
         aborted = False
 
-        for address in list(self._known_addresses):
+        for address in self._active_addresses():
             need_query = force_refresh or address not in self._balance_cache
             if need_query and not aborted:
                 try:
@@ -479,7 +546,7 @@ class DoiWallet:
         self._ensure_connected()
         all_utxos = []
 
-        for address in list(self._known_addresses):
+        for address in self._active_addresses():
             if force_refresh or address not in self._utxo_cache:
                 try:
                     self._utxo_cache[address] = self.electrum.get_utxos(address)
@@ -644,7 +711,7 @@ class DoiWallet:
         all_txs: dict[str, dict] = {}
         errors = 0
 
-        for address in list(self._known_addresses):
+        for address in self._active_addresses():
             try:
                 history = self.electrum.get_history(address)
             except (ConnectionError, RuntimeError) as e:
@@ -707,6 +774,11 @@ class DoiWallet:
             "change_index": self._change_index,
             "gap_limit": self.GAP_LIMIT,
             "last_discover": self._last_discover_iso,
+            "next_receive_index": self._receive_index,
+            "next_change_index": self._change_index,
+            "max_used_receive": self._max_used.get(0),
+            "max_used_change": self._max_used.get(1),
+            "watched_addresses": len(self._watch),
         }
 
     def __repr__(self):
