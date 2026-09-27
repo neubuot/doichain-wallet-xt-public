@@ -494,6 +494,10 @@ class WalletManager:
             state = self._load_state_file()
             if state and self.doi:
                 self.doi.set_state(state.get("doi", {}))
+            elif self.doi:
+                # v0.9.9: ohne State-Datei (Neuinstallation, verlorene
+                # .state.json) laeuft die erste Discovery als Tiefensuche.
+                self.doi._deep_scan_pending = True
         except Exception as e:
             logger.warning(f"State-Datei konnte nicht gelesen werden: {e}")
 
@@ -837,7 +841,29 @@ class WalletManager:
         """Verbindet das DOI-Wallet mit einem ElectrumX-Server."""
         if not self.doi:
             raise RuntimeError("DOI-Wallet nicht initialisiert")
-        return self.doi.connect(host, port)
+        ok = self.doi.connect(host, port)
+        # v0.9.9: korrigierte Indizes nach der Discovery sofort sichern
+        if ok:
+            try:
+                self.save_state()
+            except Exception as e:
+                logger.warning(f"State-Datei nach Discovery nicht geschrieben: {e}")
+        return ok
+
+    def deep_scan(self, gap_limit: int = 300) -> dict:
+        """
+        v0.9.9: Tiefensuche. Scannt beide Adressketten mit grosser Luecke,
+        um Guthaben zu finden, das aeltere Versionen (0.9.5 bis 0.9.8) auf
+        hohe Indizes gelegt haben. Speichert danach die State-Datei.
+        """
+        if not self.doi:
+            raise RuntimeError("DOI-Wallet nicht initialisiert")
+        diag = self.doi.discover_addresses(gap_limit=gap_limit)
+        try:
+            self.save_state()
+        except Exception as e:
+            logger.warning(f"State-Datei nach Tiefensuche nicht geschrieben: {e}")
+        return diag
 
     def check_connections(self) -> dict:
         """

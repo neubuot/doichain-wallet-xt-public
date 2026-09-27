@@ -1,6 +1,6 @@
 # DOI-Wallet-iX – Installationsanleitung
 
-**Version 0.9.8 (Beta)**
+**Version 0.9.9 (Beta)**
 
 Schritt für Schritt für Einsteiger
 
@@ -21,6 +21,12 @@ empfangen und versenden:
 | USDT (Tether) | Ein Stablecoin, der an den US-Dollar gekoppelt ist |
 | ETH (Ethereum) | Die zweitgrößte Kryptowährung der Welt |
 | wDOI (Wrapped DOI) | DOI als Token auf der Ethereum-Blockchain |
+
+**Neu in v0.9.9:**
+
+- Adresssuche repariert: Guthaben, das nach einer Neuinstallation fehlte,
+  wird wieder gefunden (Fehler seit v0.9.5, Coins waren nie in Gefahr)
+- „Tiefensuche" in der Wallet-Diagnose
 
 **Neu in v0.9.8:**
 
