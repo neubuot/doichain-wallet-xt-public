@@ -1,5 +1,7 @@
 # 🔗 Doichain Wallet XT
 
+[![Doichain Seal](https://doi-api.sendlabs.de/seal/github/neubuot/doichain-wallet-xt-public/seal.svg)](https://doi-api.sendlabs.de/seal/github/neubuot/doichain-wallet-xt-public)
+
 **Multi-Chain Desktop Wallet für Doichain (DOI), Tron (TRX), USDT TRC-20 mit XT.com Exchange-Integration.**
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)

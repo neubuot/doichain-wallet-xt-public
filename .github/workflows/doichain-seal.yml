@@ -1,0 +1,35 @@
+# Doichain Seal: versiegelt jedes Release (Tag v*) in der Doichain. Packt den Quellbaum des Tags,
+# erzeugt SHA256SUMS und verankert beide Hashes mit Repository, Tag und Commit aus dem OIDC-Token.
+# Manuell startbar (workflow_dispatch), dann wird der Stand des gewählten Zweigs versiegelt.
+name: Doichain Seal
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  seal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Quellbaum packen
+        id: pack
+        run: |
+          repo="${GITHUB_REPOSITORY#*/}"
+          name="${repo}-${GITHUB_REF_NAME}.tar.gz"
+          git archive --format=tar.gz --prefix="${repo}-${GITHUB_REF_NAME}/" -o "$name" HEAD
+          sha256sum "$name" > SHA256SUMS
+          echo "archive=$name" >> "$GITHUB_OUTPUT"
+
+      - name: In der Doichain versiegeln
+        uses: neubuot/doichain-seal@v1
+        with:
+          files: |
+            ${{ steps.pack.outputs.archive }}
+            SHA256SUMS
